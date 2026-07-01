@@ -7,6 +7,7 @@ FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENV MPLBACKEND=Agg
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
@@ -39,7 +40,7 @@ RUN pip install --no-cache-dir opencv-python==4.11.0.86
 RUN pip install --no-cache-dir numpy==1.26.4
 RUN pip install --no-cache-dir scipy==1.15.1
 RUN pip install --no-cache-dir scikit-image==0.25.1
-RUN pip install --no-cache-dir tqdm==4.67.1 requests==2.32.3 pyyaml==6.0.2
+RUN pip install --no-cache-dir matplotlib tqdm==4.67.1 requests==2.32.3 pyyaml==6.0.2
 RUN pip install --no-cache-dir einops av==12.0.0
 RUN pip install --no-cache-dir imageio==2.36.1 imageio-ffmpeg==0.5.1
 RUN pip install --no-cache-dir "scenedetect[opencv]>=0.6" ffmpeg-python==0.2.0
