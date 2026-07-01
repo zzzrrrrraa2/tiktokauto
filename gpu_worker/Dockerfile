@@ -2,7 +2,7 @@
 # RTX 4090 / A100 compatible — all weights baked into image, no Network Volume needed
 # Uses CUDA 12.4 — unified cuDNN 9 for PyTorch + PaddlePaddle 3.3
 
-FROM nvidia/cuda:12.4.0-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
