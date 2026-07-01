@@ -1,6 +1,6 @@
 opencv-python==4.11.0.86
 numpy==1.26.4
-paddlepaddle-gpu==3.0.0
+paddlepaddle-gpu==3.3.0
 paddleocr>=3.0.0
 scikit-image==0.25.1
 scipy==1.15.1

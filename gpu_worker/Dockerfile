@@ -1,8 +1,8 @@
 # GPU Worker for RunPod Serverless
 # RTX 4090 / A100 compatible — all weights baked into image, no Network Volume needed
-# Uses CUDA 12.4 for PaddlePaddle-GPU compatibility
+# Uses CUDA 11.8 for PyTorch — PaddlePaddle 3.3 bundles its own cuDNN
 
-FROM nvidia/cuda:12.4.0-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -34,7 +34,7 @@ COPY requirements.txt .
 RUN pip uninstall -y numpy || true \
     && pip install --no-cache-dir \
     torch==2.5.1 torchvision==0.20.1 \
-    --index-url https://download.pytorch.org/whl/cu124
+    --index-url https://download.pytorch.org/whl/cu118
 RUN pip install --no-cache-dir opencv-python==4.11.0.86
 RUN pip install --no-cache-dir numpy==1.26.4
 RUN pip install --no-cache-dir scipy==1.15.1
@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir tqdm==4.67.1 requests==2.32.3 pyyaml==6.0.2
 RUN pip install --no-cache-dir einops av==12.0.0
 RUN pip install --no-cache-dir imageio==2.36.1 imageio-ffmpeg==0.5.1
 RUN pip install --no-cache-dir "scenedetect[opencv]>=0.6" ffmpeg-python==0.2.0
-RUN pip install --no-cache-dir paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu124/
+RUN pip install --no-cache-dir paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
 RUN pip install --no-cache-dir paddleocr>=3.0.0
 RUN pip install --no-cache-dir runpod
 
