@@ -33,7 +33,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip uninstall -y numpy || true \
     && pip install --no-cache-dir \
-    torch==2.5.1 torchvision==0.20.1 \
+    torch==2.5.1+cu124 torchvision==0.20.1+cu124 \
     --index-url https://download.pytorch.org/whl/cu124
 RUN pip install --no-cache-dir opencv-python==4.11.0.86
 RUN pip install --no-cache-dir numpy==1.26.4
