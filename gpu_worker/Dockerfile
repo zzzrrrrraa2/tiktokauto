@@ -1,6 +1,6 @@
 # GPU Worker for RunPod Serverless
 # RTX 4090 / A100 compatible — all weights baked into image, no Network Volume needed
-# Uses CUDA 12.4 — unified cuDNN 9 for PyTorch + PaddlePaddle 3.3
+# CUDA 12.4 base + cuDNN 8 — PyTorch cu124 + PaddlePaddle 3.1.0 cu123 (forward-compatible)
 
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
@@ -43,8 +43,8 @@ RUN pip install --no-cache-dir tqdm==4.67.1 requests==2.32.3 pyyaml==6.0.2
 RUN pip install --no-cache-dir einops av==12.0.0
 RUN pip install --no-cache-dir imageio==2.36.1 imageio-ffmpeg==0.5.1
 RUN pip install --no-cache-dir "scenedetect[opencv]>=0.6" ffmpeg-python==0.2.0
-RUN pip install --no-cache-dir paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
-RUN pip install --no-cache-dir paddleocr>=3.0.0
+RUN pip install --no-cache-dir paddlepaddle-gpu==3.1.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu123/
+RUN pip install --no-cache-dir paddleocr==3.7.0
 RUN pip install --no-cache-dir runpod
 
 RUN git clone --depth 1 https://github.com/sczhou/ProPainter.git /app/propainter_repo
