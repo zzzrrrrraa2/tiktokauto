@@ -1,0 +1,45 @@
+# TikTok Automation - Caption Removal Pipeline
+# Copy this to config.yaml and fill in your values
+
+# RunPod Configuration
+runpod:
+  api_key: "YOUR_RUNPOD_API_KEY"
+  endpoint_id: "YOUR_ENDPOINT_ID"  # Serverless endpoint ID after deployment
+  
+# GPU Worker Settings
+worker:
+  concurrency: 4  # Max parallel GPU jobs
+  timeout_per_clip: 300  # Seconds per clip request
+  idle_timeout: 120  # Seconds before worker scales down
+  
+# Processing Settings
+processing:
+  max_video_duration: 120  # Max input video duration in seconds
+  clip_max_duration: 15  # Max clip duration after scene detection
+  roi_default: null  # Default ROI {x, y, w, h}, null means user must select
+  mask_dilation: 8  # Pixels to dilate the text mask
+  output_fps: null  # null = keep original FPS
+  output_codec: "libx264"
+  output_preset: "medium"
+  output_crf: 18
+
+# Paths
+paths:
+  data_dir: "./data"
+  uploads: "./data/uploads"
+  clips: "./data/clips"
+  masks: "./data/masks"
+  results: "./data/results"
+  final: "./data/final"
+
+# Scene Detection (TransNetV2)
+scene_detection:
+  min_scene_length: 1.5  # Minimum scene duration in seconds
+  threshold: 20.0  # Detection sensitivity (lower = more cuts)
+
+# Server
+server:
+  host: "127.0.0.1"
+  port: 5000
+  debug: true
+  max_upload_size_mb: 500

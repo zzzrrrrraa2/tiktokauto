@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TikTok Automation - Caption Removal</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Caption Removal Pipeline</h1>
+            <span class="subtitle">Upload video → Select caption area → Auto-inpaint</span>
+        </header>
+
+        <main>
+            <!-- Upload Section -->
+            <section id="upload-section" class="card">
+                <h2>1. Upload Video</h2>
+                <div class="upload-area" id="upload-area">
+                    <input type="file" id="video-input" accept="video/*" hidden>
+                    <div class="upload-placeholder" id="upload-placeholder">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                            <polyline points="17 8 12 3 7 8"/>
+                            <line x1="12" y1="3" x2="12" y2="15"/>
+                        </svg>
+                        <p>Drop video here or click to upload</p>
+                        <span class="hint">MP4, max 500MB</span>
+                    </div>
+                    <div class="upload-progress hidden" id="upload-progress">
+                        <div class="spinner"></div>
+                        <p>Uploading...</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ROI Selection -->
+            <section id="roi-section" class="card hidden">
+                <h2>2. Select Caption Area</h2>
+                <p class="desc">Scrub through video to find the biggest captions, then draw a rectangle around them</p>
+                <div class="roi-container" id="roi-container">
+                    <video id="preview-video" src="" preload="auto" muted></video>
+                    <div class="video-controls" id="video-controls">
+                        <button class="btn btn-small" id="btn-play-pause">▶</button>
+                        <input type="range" id="video-timeline" min="0" max="100" value="0" step="0.1">
+                        <span id="video-time">0:00 / 0:00</span>
+                    </div>
+                    <div class="roi-overlay" id="roi-overlay">
+                        <div class="roi-box" id="roi-box"></div>
+                    </div>
+                </div>
+                <div class="roi-info" id="roi-info">
+                    <span>ROI: <strong id="roi-coords">Not selected</strong></span>
+                    <button class="btn btn-secondary" id="roi-reset">Reset</button>
+                </div>
+                <button class="btn btn-primary" id="btn-start" disabled>Start Processing</button>
+            </section>
+
+            <!-- Progress Section -->
+            <section id="progress-section" class="card hidden">
+                <h2>3. Processing</h2>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="progress-bar"></div>
+                </div>
+                <div class="progress-stats">
+                    <span id="progress-text">0 / 0 clips</span>
+                    <span id="progress-status">Waiting...</span>
+                </div>
+                <div class="clip-list" id="clip-list"></div>
+                <button class="btn btn-danger hidden" id="btn-cancel">Cancel</button>
+            </section>
+
+            <!-- Result Section -->
+            <section id="result-section" class="card hidden">
+                <h2>4. Result</h2>
+                <div class="result-preview">
+                    <video id="result-video" controls></video>
+                </div>
+                <div class="result-actions">
+                    <a id="btn-download" class="btn btn-primary" href="#" download>Download Result</a>
+                    <button class="btn btn-secondary" id="btn-new-video">Process New Video</button>
+                </div>
+            </section>
+
+            <!-- History -->
+            <section id="history-section" class="card">
+                <h2>Recent Videos</h2>
+                <div class="history-list" id="history-list">
+                    <p class="empty">No videos processed yet</p>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

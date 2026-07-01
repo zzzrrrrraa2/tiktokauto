@@ -1,0 +1,17 @@
+opencv-python==4.11.0.86
+numpy==1.26.4
+paddlepaddle-gpu==2.6.2
+paddleocr==2.9.1
+scikit-image==0.25.1
+scipy==1.15.1
+tqdm==4.67.1
+requests==2.32.3
+pyyaml==6.0.2
+scenedetect[opencv]>=0.6
+ffmpeg-python==0.2.0
+
+imageio==2.36.1
+imageio-ffmpeg==0.5.1
+runpod
+einops
+av==12.0.0
