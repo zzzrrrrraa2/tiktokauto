@@ -25,15 +25,16 @@ split/concat functions are **not** used by the current `app.py` flow — that lo
 cd backend
 pip install -r requirements.txt
 python app.py                  # http://localhost:5000, config from ../config.yaml
-
-# GPU Worker — build and push to a registry, then create a RunPod Serverless endpoint from it
-cd gpu_worker
-docker build -t caption-removal-worker:v1 .
-docker tag caption-removal-worker:v1 <registry>/caption-removal-worker:v1
-docker push <registry>/caption-removal-worker:v1
 ```
 
-There is no test suite, linter, or CI configured in this repo.
+**GPU worker deploys via GitHub Actions, not local Docker.** Any push touching `gpu_worker/**` triggers
+`.github/workflows/build.yml`, which builds the image and pushes it to Docker Hub as
+`shokiii/caption-removal-worker:<tag>` (needs the `DOCKERHUB_TOKEN` repo secret). The tag is **hardcoded
+in the workflow** (currently `v9`) — to ship a new image version, bump the tag in `build.yml` *and*
+update the RunPod Serverless endpoint to reference the new tag. A local `docker build` in `gpu_worker/`
+works too if Docker is available, but the CI path is how this repo actually deploys.
+
+There is no test suite or linter configured in this repo; the only CI is the image build above.
 
 ## Video transfer: private Google Drive files + short-lived OAuth token
 
@@ -64,8 +65,8 @@ Despite what `README.md` says, `handler.py`'s `detect_scenes()` uses **PySceneDe
 
 The `Dockerfile` bakes the three ProPainter `.pth` files **and** the PaddleOCR models into the image at
 build time — no Network Volume, no cold-start downloads. `handler.py` keeps `_download_weights()` at import
-time as a safety net (it's a no-op when the files exist). `DEPLOY.md`'s "Create Network Volume" / "Populate
-Weights" sections are stale.
+time as a safety net (it's a no-op when the files exist). `DEPLOY.md` says the opposite (weights fetched on
+cold start) — the Dockerfile is the source of truth.
 
 ## GPU worker processing details
 
@@ -75,9 +76,19 @@ Weights" sections are stale.
 - Clips are split **re-encoded** (`libx264`, CFR) rather than stream-copied, so cuts are frame-accurate and
   the concat demuxer is safe. Audio is dropped at split time and muxed back from the original in the final
   step (`mux_audio`).
-- OCR runs every 5th frame (masks are reused between keyframes), on a BGR crop, via `ocr.predict()`
-  (PaddleOCR 3.x API — no `cls`/`use_angle_cls`/`use_gpu` params, results read from `res["dt_polys"]`).
-  Clips with no detected text skip ProPainter entirely.
+- **OCR → mask is a per-clip union, not per-frame.** `run_ocr()` samples every `OCR_STEP` (2) frames on a
+  BGR ROI crop via `ocr.predict()` (PaddleOCR 3.x API — no `cls`/`use_angle_cls`/`use_gpu` params, results
+  read from `res["dt_polys"]`), unions every detected polygon into a single mask, scales that union by
+  `OVERSHOOT_SCALE` (1.15×) around its bounding-box center to cover pop-in/out overshoot, and returns that
+  *same* mask for every frame in the clip. This is deliberate: captions here are fast, animated, one-word
+  pop-ins (~6-12 frames @ 30fps) that sparser/per-frame masking would miss or lag behind, and a temporally
+  constant mask is what ProPainter wants for a stable fill. Trade-off: caption-free frames in a clip also
+  get their caption band inpainted — acceptable since that band is overlaid with new captions downstream.
+  Clips with no detected text anywhere skip ProPainter entirely (`has_text` check in `process_clip`).
+- **PaddleOCR CPU fallback**: if Paddle GPU construction/inference throws (e.g. wheel lacks CUDA kernels
+  for the GPU model RunPod scheduled), `_ocr_predict()` rebuilds the OCR singleton on CPU and continues —
+  slower, but the job survives. `gpu_diagnostic()` logs the GPU model, compute capability, and a torch
+  CUDA kernel check at the start of every job; check job logs for this when debugging GPU issues.
 - The handler cleans `/tmp` work dirs in a `finally` block — warm workers don't accumulate disk usage.
 
 ## Configuration priority
@@ -93,12 +104,16 @@ endpoint_id=os.environ.get("RUNPOD_ENDPOINT_ID", config["runpod"]["endpoint_id"]
 `.env` must live in the **repo root** (not `backend/`) — `app.py` loads it via
 `Path(__file__).parent.parent / ".env"`. Required vars: `RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID`.
 
-`config.yaml` (copy from `config.yaml`'s own header comment / `.env.example` pattern) controls
-`worker.concurrency`, `worker.timeout_per_clip`, `scene_detection.threshold`/`min_scene_length`,
+`config.yaml` (checked in; its header comment says "copy this to config.yaml" but it *is* the live config)
+controls `worker.concurrency`, `worker.timeout_per_clip`, `scene_detection.threshold`/`min_scene_length`,
 `processing.mask_dilation`, and `server.port`/`host`/`debug`.
 
 ## Other quirks
 
+- **Trust the code over the prose docs.** `README.md`, `AGENTS.md`, and `DEPLOY.md` all still describe the
+  old transfer flow (public Drive download URL / `video_download_url`) instead of the current private-file
+  `video_file_id` + `drive_access_token` flow, and `README.md`/`DEPLOY.md` reference
+  `gpu_worker/download_weights.py`, which does not exist in the checkout.
 - **`data/queue.db`** (SQLite, `backend/pipeline/job_queue.py`) is auto-created at runtime and persists
   between restarts. Delete it to reset all job state. It tracks per-video status and a `clips` table that is
   largely vestigial now — clip-level tracking actually happens inside the GPU worker, not in this DB.

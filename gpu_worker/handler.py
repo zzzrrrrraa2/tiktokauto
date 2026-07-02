@@ -85,6 +85,12 @@ DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 CROP_MARGIN = 96
 CROP_MIN_SIZE = 160
 
+# Captions here are fast, animated, one-word pop-ins (~6-12 frames @ 30fps).
+# Sample densely and take the union of every detection across the clip, then
+# apply that single mask to every frame — see run_ocr() for rationale.
+OCR_STEP = 2
+OVERSHOOT_SCALE = 1.15
+
 
 # ---------------------------------------------------------------------------
 # Google Drive transfer (plain REST — no client libraries needed on the worker)
@@ -329,41 +335,48 @@ def clamp_roi(roi: dict, width: int, height: int) -> dict:
 
 
 def run_ocr(frames, roi: dict) -> list:
-    """Run PaddleOCR text detection on keyframes within the ROI.
-    Returns one full-frame uint8 mask (0/255) per frame."""
+    """Detect caption text across the clip and return ONE union mask, applied to
+    every frame.
+
+    Captions here are fast, animated, one-word pop-ins (~6-12 frames @ 30fps) —
+    a word can appear and vanish between sparse OCR samples, or be caught mid-
+    animation when it's smaller than its peak size. Sampling every OCR_STEP frames
+    and unioning every detected polygon (scaled up by OVERSHOOT_SCALE to cover the
+    pop-in/out overshoot) guarantees every word is covered at its biggest extent,
+    and using the same mask on every frame keeps the ProPainter hole temporally
+    stable. The caption band gets inpainted even on the rare word-free frame —
+    acceptable since it's overlaid with new (translated) captions downstream.
+    """
     try:
         import paddleocr  # noqa: F401 — availability check only
     except ImportError:
         return _fallback_text_detection(frames, roi)
 
     x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
-    mask_frames = []
-    ocr_step = 5
-    last_mask = None
+    frame_h, frame_w = frames[0].shape[:2]
+    union = np.zeros((frame_h, frame_w), dtype=np.uint8)
 
-    for i in range(len(frames)):
-        frame_np = frames[i]
-        mask = np.zeros(frame_np.shape[:2], dtype=np.uint8)
+    for i in range(0, len(frames), OCR_STEP):
+        roi_bgr = cv2.cvtColor(frames[i][y:y+h, x:x+w], cv2.COLOR_RGB2BGR)
+        result = _ocr_predict(roi_bgr)
+        for res in result or []:
+            polys = res.get("dt_polys") if hasattr(res, "get") else None
+            if polys is None:
+                continue
+            for box in polys:
+                box = np.asarray(box, dtype=np.int32).reshape(-1, 2)
+                box[:, 0] += x
+                box[:, 1] += y
+                cv2.fillPoly(union, [box], 255)
 
-        if i % ocr_step == 0:
-            roi_bgr = cv2.cvtColor(frame_np[y:y+h, x:x+w], cv2.COLOR_RGB2BGR)
-            result = _ocr_predict(roi_bgr)
-            for res in result or []:
-                polys = res.get("dt_polys") if hasattr(res, "get") else None
-                if polys is None:
-                    continue
-                for box in polys:
-                    box = np.asarray(box, dtype=np.int32).reshape(-1, 2)
-                    box[:, 0] += x
-                    box[:, 1] += y
-                    cv2.fillPoly(mask, [box], 255)
-            last_mask = mask
-        elif last_mask is not None:
-            mask = last_mask.copy()
+    if union.any():
+        ys, xs = np.nonzero(union)
+        cx, cy = (xs.min() + xs.max()) / 2.0, (ys.min() + ys.max()) / 2.0
+        scale_mat = cv2.getRotationMatrix2D((cx, cy), 0, OVERSHOOT_SCALE)
+        scaled = cv2.warpAffine(union, scale_mat, (frame_w, frame_h), flags=cv2.INTER_NEAREST)
+        union = cv2.bitwise_or(union, scaled)
 
-        mask_frames.append(mask)
-
-    return mask_frames
+    return [union.copy() for _ in range(len(frames))]
 
 
 def _fallback_text_detection(frames, roi: dict) -> list:
