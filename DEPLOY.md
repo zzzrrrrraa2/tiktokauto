@@ -4,7 +4,8 @@ This covers deploying the video inpainting worker (PaddleOCR + ProPainter) on Ru
 
 ## Overview
 
-The GPU worker receives a video clip + ROI coordinates, runs OCR to find text, generates masks, and runs ProPainter for inpainting. Results are returned to the local backend.
+The GPU worker receives a video (as a `video_download_url`) + ROI coordinates, runs scene detection, OCR to
+find text, generates masks, and runs ProPainter for inpainting. Results are returned to the local backend.
 
 ## Prerequisites
 
@@ -12,54 +13,20 @@ The GPU worker receives a video clip + ROI coordinates, runs OCR to find text, g
 - API key from Settings → API Keys
 - Docker installed locally (for building/pushing the image)
 
-## Step 1: Create Network Volume
+## Weights: no Network Volume needed
 
-Network Volumes persist across worker restarts and hold the model weights (~500MB).
+The current `gpu_worker/Dockerfile` builds a self-contained image (PyTorch cu124 + PaddlePaddle-GPU cu118 +
+PaddleOCR, cloned ProPainter repo). It does **not** bake ProPainter's `.pth` weights into the image at build
+time — instead, `handler.py`'s `_download_weights()` fetches the three ProPainter weight files from GitHub
+releases into `/app/weights` automatically the first time the container cold-starts. PaddleOCR downloads its
+own models on first use the same way.
 
-1. Go to RunPod → Storage → Network Volumes
-2. Create volume:
-   - **Name**: `caption-removal-weights`
-   - **Region**: Pick one close to you
-   - **Size**: 20 GB (minimum)
-   - **Data Center**: Any with RTX 4090 availability
-3. Note the Volume ID
+This means you do **not** need to create a RunPod Network Volume or pre-populate weights before deploying —
+just make sure the endpoint has outbound network access on cold start. `gpu_worker/download_weights.py` (a
+script for populating a `/weights` Network Volume with ProPainter + TransNetV2 weights) is a leftover from an
+earlier architecture and is not part of the current deploy path — ignore it.
 
-## Step 2: Populate Weights
-
-Spin up a temporary GPU Pod to download model weights onto the Network Volume.
-
-1. Go to Pods → Deploy
-2. Select **RTX 4090** (or any cheap GPU)
-3. Template: `runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04`
-4. Attach the Network Volume, mount at `/weights`
-5. Start the pod
-6. SSH in or use Web Terminal:
-
-```bash
-cd /weights
-git clone --depth 1 https://github.com/sczhou/ProPainter.git propainter_repo
-
-mkdir -p propainter/model propainter/core
-
-# Symlink model files so Python imports work from /weights/propainter/* 
-ln -s /weights/propainter_repo/model/modules /weights/propainter/model/modules
-ln -s /weights/propainter_repo/model/misc.py /weights/propainter/model/misc.py
-ln -s /weights/propainter_repo/model/propainter.py /weights/propainter/model/propainter.py
-ln -s /weights/propainter_repo/model/recurrent_flow_completion.py /weights/propainter/model/recurrent_flow_completion.py
-ln -s /weights/propainter_repo/core/utils.py /weights/propainter/core/utils.py
-
-# Download weights
-wget -P /weights/propainter https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth
-wget -P /weights/propainter https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth
-wget -P /weights/propainter https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth
-
-# Verify
-ls -lh /weights/propainter/*.pth
-```
-
-7. Stop/terminate the pod (volume persists)
-
-## Step 3: Build and Push Docker Image
+## Step 1: Build and Push Docker Image
 
 ```bash
 cd gpu_worker
@@ -74,14 +41,13 @@ docker tag caption-removal-worker:v1 yourusername/caption-removal-worker:v1
 docker push yourusername/caption-removal-worker:v1
 ```
 
-## Step 4: Create Serverless Endpoint
+## Step 2: Create Serverless Endpoint
 
 1. Go to RunPod → Serverless → New Endpoint
 2. Configure:
    - **Endpoint Name**: `caption-removal`
    - **GPU Type**: RTX 4090 (24GB)
    - **Container Image**: `yourusername/caption-removal-worker:v1`
-   - **Network Volume**: Attach `caption-removal-weights`, mount at `/weights`
    - **Min Workers**: 0 (scale to zero when idle)
    - **Max Workers**: 5 (concurrent clip processing)
    - **Idle Timeout**: 120 seconds
@@ -90,10 +56,12 @@ docker push yourusername/caption-removal-worker:v1
    - **Container Disk**: 30 GB
    - **Worker Memory**: 48 GB
 
+   No Network Volume attachment is needed — see "Weights: no Network Volume needed" above.
+
 3. Create endpoint
 4. Note the Endpoint ID (e.g., `abc123def456`)
 
-## Step 5: Configure Local Backend
+## Step 3: Configure Local Backend
 
 Set your RunPod credentials:
 
@@ -114,17 +82,20 @@ runpod:
 ## Testing
 
 ```bash
-# Test the endpoint directly
+# Test the endpoint directly — handler.py expects a video_download_url (or video_data_b64 /
+# video_path for manual testing), not a per-clip path; it runs the full pipeline internally.
 curl -X POST "https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/run" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "input": {
-      "clip_path": "/path/to/test_clip.mp4",
+      "video_download_url": "https://example.com/test_video.mp4",
       "roi": {"x": 0, "y": 600, "w": 1080, "h": 120},
       "fps": 30,
-      "clip_id": "test_001",
-      "mask_dilation": 8
+      "video_id": "test_001",
+      "mask_dilation": 8,
+      "scene_threshold": 27.0,
+      "min_scene_length": 1.5
     }
   }'
 ```
