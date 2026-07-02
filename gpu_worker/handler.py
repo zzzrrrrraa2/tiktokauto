@@ -281,13 +281,14 @@ def write_video(frames, fps: float, output_path: str):
 # ---------------------------------------------------------------------------
 
 _OCR = None
+_OCR_ON_CPU = False
 
 
-def _get_ocr():
-    global _OCR
-    if _OCR is None:
+def _get_ocr(cpu: bool = False):
+    global _OCR, _OCR_ON_CPU
+    if _OCR is None or (cpu and not _OCR_ON_CPU):
         from paddleocr import PaddleOCR
-        _OCR = PaddleOCR(
+        kwargs = dict(
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
@@ -296,7 +297,27 @@ def _get_ocr():
             text_det_box_thresh=0.4,
             text_det_unclip_ratio=1.5
         )
+        if cpu:
+            kwargs["device"] = "cpu"
+        _OCR = PaddleOCR(**kwargs)
+        _OCR_ON_CPU = cpu
     return _OCR
+
+
+def _ocr_predict(img):
+    """Run OCR on the default (GPU) instance; if Paddle fails at construction
+    or inference (e.g. missing CUDA kernels for this GPU model), rebuild the
+    singleton on CPU and continue — slower, but the job survives."""
+    try:
+        return _get_ocr().predict(img)
+    except ImportError:
+        raise
+    except Exception as e:
+        if _OCR_ON_CPU:
+            raise
+        print(f"[GPU_WORKER] PaddleOCR GPU inference failed ({type(e).__name__}: {e}); "
+              f"falling back to CPU OCR", flush=True)
+        return _get_ocr(cpu=True).predict(img)
 
 
 def clamp_roi(roi: dict, width: int, height: int) -> dict:
@@ -311,7 +332,7 @@ def run_ocr(frames, roi: dict) -> list:
     """Run PaddleOCR text detection on keyframes within the ROI.
     Returns one full-frame uint8 mask (0/255) per frame."""
     try:
-        ocr = _get_ocr()
+        import paddleocr  # noqa: F401 — availability check only
     except ImportError:
         return _fallback_text_detection(frames, roi)
 
@@ -326,7 +347,7 @@ def run_ocr(frames, roi: dict) -> list:
 
         if i % ocr_step == 0:
             roi_bgr = cv2.cvtColor(frame_np[y:y+h, x:x+w], cv2.COLOR_RGB2BGR)
-            result = ocr.predict(roi_bgr)
+            result = _ocr_predict(roi_bgr)
             for res in result or []:
                 polys = res.get("dt_polys") if hasattr(res, "get") else None
                 if polys is None:
@@ -634,6 +655,19 @@ def init_models():
         fix_raft, fix_flow_complete, propainter_model = load_propainter_models()
 
 
+def gpu_diagnostic(log):
+    """Log which GPU this worker landed on and prove torch CUDA kernels run.
+    The endpoint pool mixes 8 GPU models — this line is how per-model failures
+    get correlated across jobs."""
+    if not torch.cuda.is_available():
+        log("WARNING: torch.cuda not available — inpainting will run on CPU (very slow)")
+        return
+    name = torch.cuda.get_device_name(0)
+    cap = torch.cuda.get_device_capability(0)
+    check = (torch.randn(8, 8, device="cuda") @ torch.randn(8, 8, device="cuda")).sum().item()
+    log(f"GPU: {name} (sm_{cap[0]}{cap[1]}) — torch CUDA kernel check OK ({check:+.2f})")
+
+
 def handler(job):
     """RunPod serverless handler — full pipeline."""
     job_input = job["input"]
@@ -692,6 +726,7 @@ def handler(job):
     os.makedirs(work_dir, exist_ok=True)
 
     try:
+        gpu_diagnostic(log)
         log("Loading ProPainter models...")
         init_models()
         log("Models loaded")
