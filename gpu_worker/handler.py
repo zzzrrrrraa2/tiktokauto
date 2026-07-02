@@ -171,7 +171,6 @@ def run_ocr(frames: list, roi: dict) -> list:
     ocr = PaddleOCR(
         use_angle_cls=False,
         lang="en",
-        use_gpu=True,
         show_log=False,
         det_db_thresh=0.3,
         det_db_box_thresh=0.4,
