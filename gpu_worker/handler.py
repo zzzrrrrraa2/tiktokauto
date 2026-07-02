@@ -169,12 +169,11 @@ def run_ocr(frames: list, roi: dict) -> list:
         return _fallback_text_detection(frames, roi)
 
     ocr = PaddleOCR(
-        use_angle_cls=False,
+        use_textline_orientation=False,
         lang="en",
-        show_log=False,
-        det_db_thresh=0.3,
-        det_db_box_thresh=0.4,
-        det_db_unclip_ratio=1.5
+        text_det_thresh=0.3,
+        text_det_box_thresh=0.4,
+        text_det_unclip_ratio=1.5
     )
 
     x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
