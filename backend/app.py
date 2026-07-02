@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import threading
 import time
 import uuid
@@ -7,6 +8,7 @@ import yaml
 import requests
 import io
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -21,7 +23,8 @@ from flask_cors import CORS
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pipeline.ffmpeg_utils import probe_video, extract_frame
+from pipeline.ffmpeg_utils import probe_video, extract_frame, split_video, concat_clips, mux_audio
+from pipeline.scene_detect import detect_scenes, subdivide_segments
 from pipeline.runpod_client import RunPodClient
 from pipeline.job_queue import JobQueue
 
@@ -126,8 +129,28 @@ def delete_from_drive(file_id: str, creds):
         pass  # cleanup is best-effort; orphaned files only cost Drive quota
 
 
+def _job_payload(file_id: str, roi: dict, job_video_id: str, token: str) -> dict:
+    """RunPod job payload — identical shape whether file_id is a whole video or
+    a single clip (the worker pipeline handles both)."""
+    proc = config["processing"]
+    return {
+        "video_file_id": file_id,
+        "drive_access_token": token,
+        "roi": roi,
+        "video_id": job_video_id,
+        "mask_dilation": proc["mask_dilation"],
+        "mask_scale_x": proc.get("mask_scale_x", 1.45),
+        "mask_scale_y": proc.get("mask_scale_y", 1.15),
+        "mask_pad_x": proc.get("mask_pad_x", 8),
+        "debug_masks": proc.get("debug_masks", True),
+        "scene_threshold": config["scene_detection"]["threshold"],
+        "min_scene_length": config["scene_detection"]["min_scene_length"],
+        "max_clip_duration": proc["clip_max_duration"]
+    }
+
+
 def process_video_pipeline(video_id: str):
-    """Background pipeline: upload video to file host, send download URL to GPU worker."""
+    """Background pipeline dispatcher."""
     log = lambda msg: print(f"[BACKEND] [{video_id}] {msg}")
     try:
         log("Starting pipeline")
@@ -147,71 +170,181 @@ def process_video_pipeline(video_id: str):
 
         queue.update_video_status(video_id, "gpu_processing")
 
-        video_path = video["video_path"]
-        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-        log(f"Uploading video to Google Drive: {video_path} ({file_size_mb:.1f} MB)")
-
-        creds = _get_drive_creds()
-        video_file_id = upload_to_drive(video_path, f"{video_id}.mp4", creds)
-        log(f"Uploaded — Drive file id: {video_file_id}")
-
-        payload = {
-            "video_file_id": video_file_id,
-            "drive_access_token": creds.token,
-            "roi": roi,
-            "video_id": video_id,
-            "mask_dilation": config["processing"]["mask_dilation"],
-            "mask_scale_x": config["processing"].get("mask_scale_x", 1.45),
-            "mask_scale_y": config["processing"].get("mask_scale_y", 1.15),
-            "mask_pad_x": config["processing"].get("mask_pad_x", 8),
-            "debug_masks": config["processing"].get("debug_masks", True),
-            "scene_threshold": config["scene_detection"]["threshold"],
-            "min_scene_length": config["scene_detection"]["min_scene_length"],
-            "max_clip_duration": config["processing"]["clip_max_duration"]
-        }
-        timeout = config["worker"]["timeout_per_clip"] * 20
-        log(f"Sending to RunPod — timeout={timeout}s")
-
-        try:
-            result = runpod.run_sync(payload, timeout=timeout)
-        finally:
-            delete_from_drive(video_file_id, creds)
-        log(f"RunPod response received — keys={list(result.keys()) if result else 'None'}")
-
-        if result and result.get("error"):
-            raise RuntimeError(f"GPU worker error: {result['error']}")
-
-        result_file_id = (result or {}).get("result_file_id", "")
-        if result_file_id:
-            final_dir = DATA_DIR / "final"
-            final_dir.mkdir(parents=True, exist_ok=True)
-            final_path = str(final_dir / f"{video_id}_final.mp4")
-
-            log(f"Downloading result from Drive (file id {result_file_id})")
-            download_from_drive(result_file_id, final_path, creds)
-            delete_from_drive(result_file_id, creds)
-
-            debug_file_id = (result or {}).get("debug_file_id", "")
-            if debug_file_id:
-                try:
-                    debug_path = str(final_dir / f"{video_id}_debug.mp4")
-                    download_from_drive(debug_file_id, debug_path, creds)
-                    delete_from_drive(debug_file_id, creds)
-                    log(f"Debug overlay saved to {debug_path}")
-                except Exception as e:
-                    log(f"Debug overlay download failed (non-fatal): {e}")
-
-            log(f"Pipeline complete — result saved to {final_path}")
-            queue.set_video_result(video_id, final_path)
+        if config["processing"].get("parallel_clips", True):
+            _process_parallel_clips(video_id, video, roi, log)
         else:
-            log("ERROR: no result_file_id in RunPod response")
-            queue.update_video_status(video_id, "failed")
-            queue._log(video_id, None, "pipeline_error", "No result file id from GPU worker")
+            _process_whole_video(video_id, video, roi, log)
 
     except Exception as e:
         log(f"ERROR: {e}")
         queue.update_video_status(video_id, "failed")
         queue._log(video_id, None, "pipeline_error", str(e))
+
+
+def _process_parallel_clips(video_id: str, video: dict, roi: dict, log):
+    """Split locally, fan one RunPod job out per clip (endpoint Max Workers is
+    the concurrency cap), reassemble locally. The GPU worker is unchanged — it
+    just receives a short video."""
+    video_path = video["video_path"]
+    fps = video["fps"] or probe_video(video_path)["fps"]
+
+    work_dir = DATA_DIR / "clips" / video_id
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    log("Detecting scenes locally...")
+    cuts = detect_scenes(video_path,
+                         threshold=config["scene_detection"]["threshold"],
+                         min_scene_length=config["scene_detection"]["min_scene_length"])
+    segments = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
+    segments = subdivide_segments(segments, config["processing"]["clip_max_duration"])
+
+    log(f"Splitting into {len(segments)} clips locally...")
+    clip_paths = split_video(video_path, segments, str(work_dir), fps)
+    n = len(clip_paths)
+    queue.clear_clips(video_id)
+    clip_ids = queue.create_clips_batch(video_id, segments, clip_paths)
+
+    creds = _get_drive_creds()
+    token = creds.token
+
+    log(f"Uploading {n} clips to Drive...")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        file_ids = list(pool.map(
+            lambda iv: upload_to_drive(iv[1], f"{video_id}_c{iv[0]+1:04d}.mp4", creds),
+            enumerate(clip_paths)))
+
+    jobs = {}
+    for i, fid in enumerate(file_ids):
+        job_id = runpod.submit_job(_job_payload(fid, roi, f"{video_id}_c{i+1:04d}", token))
+        jobs[i] = job_id
+        queue.update_clip_status(clip_ids[i], "gpu_processing", runpod_job_id=job_id)
+    log(f"Submitted {n} RunPod jobs — endpoint Max Workers caps the parallelism")
+
+    per_clip_timeout = config["worker"]["timeout_per_clip"] * 4
+
+    def wait_and_fetch(i):
+        """Wait for clip i's job, retrying once on failure. Downloads the
+        result (and debug overlay, best-effort). Returns (i, result, debug)."""
+        for attempt in (1, 2):
+            job_id = jobs[i] if attempt == 1 else runpod.submit_job(
+                _job_payload(file_ids[i], roi, f"{video_id}_c{i+1:04d}", token))
+            try:
+                status = runpod.wait_for_job(job_id, poll_interval=3.0,
+                                             timeout=per_clip_timeout)
+            except TimeoutError:
+                if attempt == 2:
+                    queue.update_clip_status(clip_ids[i], "failed",
+                                             error_message="timed out twice")
+                    raise
+                log(f"clip {i+1}/{n}: timed out, retrying")
+                continue
+            out = status.get("output") or {}
+            if status["status"] != "COMPLETED" or out.get("error"):
+                err = out.get("error") or status["status"]
+                if attempt == 2:
+                    queue.update_clip_status(clip_ids[i], "failed", error_message=str(err))
+                    raise RuntimeError(f"clip {i+1}/{n} failed twice: {err}")
+                log(f"clip {i+1}/{n}: failed ({err}), retrying")
+                continue
+
+            result_path = str(work_dir / f"result_{i+1:04d}.mp4")
+            download_from_drive(out["result_file_id"], result_path, creds)
+            delete_from_drive(out["result_file_id"], creds)
+
+            debug_path = None
+            if out.get("debug_file_id"):
+                try:
+                    debug_path = str(work_dir / f"debug_{i+1:04d}.mp4")
+                    download_from_drive(out["debug_file_id"], debug_path, creds)
+                    delete_from_drive(out["debug_file_id"], creds)
+                except Exception as e:
+                    log(f"clip {i+1}/{n}: debug download failed (non-fatal): {e}")
+                    debug_path = None
+
+            queue.update_clip_status(clip_ids[i], "completed",
+                                     runpod_job_id=job_id, result_path=result_path)
+            log(f"clip {i+1}/{n} completed (worker {out.get('worker_version', '?')})")
+            return i, result_path, debug_path
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(n, 16)) as pool:
+            results = list(pool.map(wait_and_fetch, range(n)))
+    finally:
+        for fid in file_ids:
+            delete_from_drive(fid, creds)
+
+    log("All clips done — concatenating and muxing audio...")
+    results.sort(key=lambda t: t[0])
+    final_dir = DATA_DIR / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    video_only = str(work_dir / "video_only.mp4")
+    concat_clips([r[1] for r in results], video_only)
+    final_path = str(final_dir / f"{video_id}_final.mp4")
+    mux_audio(video_only, video_path, final_path)
+
+    debug_paths = [r[2] for r in results if r[2]]
+    if debug_paths:
+        try:
+            concat_clips(debug_paths, str(final_dir / f"{video_id}_debug.mp4"))
+            log(f"Debug overlay saved to {final_dir / f'{video_id}_debug.mp4'}")
+        except Exception as e:
+            log(f"Debug concat failed (non-fatal): {e}")
+
+    queue.set_video_result(video_id, final_path)
+    log(f"Pipeline complete — result saved to {final_path}")
+    shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _process_whole_video(video_id: str, video: dict, roi: dict, log):
+    """Legacy single-job path (processing.parallel_clips: false): the whole
+    video is one RunPod job and the worker splits/concats internally."""
+    video_path = video["video_path"]
+    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    log(f"Uploading video to Google Drive: {video_path} ({file_size_mb:.1f} MB)")
+
+    creds = _get_drive_creds()
+    video_file_id = upload_to_drive(video_path, f"{video_id}.mp4", creds)
+    log(f"Uploaded — Drive file id: {video_file_id}")
+
+    payload = _job_payload(video_file_id, roi, video_id, creds.token)
+    timeout = config["worker"]["timeout_per_clip"] * 20
+    log(f"Sending to RunPod — timeout={timeout}s")
+
+    try:
+        result = runpod.run_sync(payload, timeout=timeout)
+    finally:
+        delete_from_drive(video_file_id, creds)
+    log(f"RunPod response received — keys={list(result.keys()) if result else 'None'}")
+
+    if result and result.get("error"):
+        raise RuntimeError(f"GPU worker error: {result['error']}")
+
+    result_file_id = (result or {}).get("result_file_id", "")
+    if not result_file_id:
+        raise RuntimeError("No result file id from GPU worker")
+
+    final_dir = DATA_DIR / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    final_path = str(final_dir / f"{video_id}_final.mp4")
+
+    log(f"Downloading result from Drive (file id {result_file_id})")
+    download_from_drive(result_file_id, final_path, creds)
+    delete_from_drive(result_file_id, creds)
+
+    debug_file_id = (result or {}).get("debug_file_id", "")
+    if debug_file_id:
+        try:
+            debug_path = str(final_dir / f"{video_id}_debug.mp4")
+            download_from_drive(debug_file_id, debug_path, creds)
+            delete_from_drive(debug_file_id, creds)
+            log(f"Debug overlay saved to {debug_path}")
+        except Exception as e:
+            log(f"Debug overlay download failed (non-fatal): {e}")
+
+    log(f"Pipeline complete — result saved to {final_path}")
+    queue.set_video_result(video_id, final_path)
 
 
 @app.route("/")
@@ -292,6 +425,14 @@ def video_status(video_id):
     video = queue.get_video(video_id)
     if not video:
         return jsonify({"status": "not_found"}), 404
+
+    # Parallel-clip runs have real per-clip rows; the overall status always
+    # comes from the video row (clips finish before the final concat/mux does).
+    summary = queue.get_video_status_summary(video_id)
+    if summary["total"] > 0:
+        summary["status"] = video["status"]
+        return jsonify(summary)
+
     return jsonify({
         "status": video["status"],
         "total": 1,

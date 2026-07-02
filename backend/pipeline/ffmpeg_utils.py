@@ -85,24 +85,32 @@ def frames_to_video(frame_dir: str, output_path: str, fps: float, codec: str = "
     subprocess.run(cmd, capture_output=True, check=True)
 
 
-def split_video(input_path: str, segments: list[tuple[float, float]], output_dir: str) -> list[str]:
-    """Split video into clips. segments = [(start, end), ...]. Returns clip paths."""
+def split_video(input_path: str, segments: list[tuple[float, float]], output_dir: str,
+                fps: float) -> list[str]:
+    """Split video into frame-accurate clips (re-encoded, video-only, CFR).
+    Ported from gpu_worker/handler.py — stream-copy cuts snap to keyframes and
+    are unsafe to concat; re-encoding keeps cuts exact and the concat demuxer
+    happy. Audio is dropped here and muxed back from the original at the end."""
     os.makedirs(output_dir, exist_ok=True)
     clip_paths = []
     for i, (start, end) in enumerate(segments):
         duration = end - start
         clip_path = os.path.join(output_dir, f"clip_{i+1:04d}.mp4")
         cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss", str(start),
+            "ffmpeg", "-y",
+            "-ss", f"{start:.3f}",
             "-i", input_path,
-            "-t", str(duration),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
+            "-t", f"{duration:.3f}",
+            "-an",
+            "-vsync", "cfr", "-r", f"{fps}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
             clip_path
         ]
-        subprocess.run(cmd, capture_output=True, check=True)
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg split failed for segment {i}: "
+                               f"{proc.stderr.decode(errors='replace')[-2000:]}")
         clip_paths.append(clip_path)
     return clip_paths
 
@@ -125,6 +133,25 @@ def concat_clips(clip_paths: list[str], output_path: str):
     ]
     subprocess.run(cmd, capture_output=True, check=True)
     os.remove(concat_file)
+
+
+def mux_audio(video_path: str, audio_source_path: str, output_path: str):
+    """Copy the processed video stream and add the original audio (if any).
+    Ported from gpu_worker/handler.py — the '?' makes the audio map optional so
+    audio-less sources still mux cleanly."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_source_path,
+        "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart",
+        output_path
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg audio mux failed: "
+                           f"{proc.stderr.decode(errors='replace')[-2000:]}")
 
 
 def resize_video(input_path: str, output_path: str, width: int, height: int):

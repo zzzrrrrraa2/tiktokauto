@@ -16,6 +16,9 @@ worker:
 processing:
   max_video_duration: 120  # Max input video duration in seconds
   clip_max_duration: 15  # Max clip duration after scene detection
+  parallel_clips: true  # split locally + one RunPod job per clip (parallelism is
+                        # capped by the endpoint's Max Workers, set in the RunPod
+                        # console). false = legacy single job for the whole video.
   roi_default: null  # Default ROI {x, y, w, h}, null means user must select
   mask_dilation: 8  # Pixels to dilate the text mask
   # Per-word mask expansion (sent to the GPU worker per job — tune here and

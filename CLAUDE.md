@@ -12,11 +12,19 @@ Two isolated components, deployed separately:
 - **`gpu_worker/`** — RunPod Serverless handler. Runs scene detection, OCR, and inpainting. Deployed as a
   Docker container to RunPod.
 
-The backend sends the **entire uploaded video** to the GPU worker as a single RunPod job. The GPU worker
-(`gpu_worker/handler.py`) does everything else internally: scene detection, splitting into clips, per-clip
-OCR + mask generation + inpainting, and re-concatenation. `backend/pipeline/ffmpeg_utils.py` exists but its
-split/concat functions are **not** used by the current `app.py` flow — that logic is duplicated inside
-`handler.py` and runs GPU-side.
+**Default flow (`processing.parallel_clips: true`):** the backend scene-detects and splits the video
+locally (`backend/pipeline/scene_detect.py` + `ffmpeg_utils.split_video`, re-encoded video-only CFR
+clips), uploads each clip to Drive, and submits **one RunPod job per clip, all at once**. RunPod's queue
+feeds them to the endpoint's workers — effective parallelism = the endpoint's **Max Workers** (set in the
+RunPod console, currently 10). The backend downloads the finished clips, concats them, and muxes the
+original audio back (`ffmpeg_utils.concat_clips`/`mux_audio`). This took a 63s/22-clip video from ~25 min
+(sequential on one worker) to a few minutes.
+
+**Legacy flow (`parallel_clips: false`):** the entire video goes to the GPU worker as a single job and
+`gpu_worker/handler.py` does everything internally (scene detection, split, per-clip processing, concat).
+The worker is unchanged either way — a "clip job" is just a short video to it, so the split/scene-detect
+logic exists in **both** components (`scene_detect.py` is a verbatim port from `handler.py`; keep them in
+sync).
 
 ## Commands
 
@@ -33,6 +41,11 @@ python app.py                  # http://localhost:5000, config from ../config.ya
 in the workflow** (currently `v9`) — to ship a new image version, bump the tag in `build.yml` *and*
 update the RunPod Serverless endpoint to reference the new tag. A local `docker build` in `gpu_worker/`
 works too if Docker is available, but the CI path is how this repo actually deploys.
+
+**Never judge a GPU-worker change without proving the new image ran**: the endpoint tag flip is manual
+and has silently not happened before (an entire test round was wasted on it). The first log line of every
+job is `Worker vN — ...` and the job output contains `worker_version` — check it matches the tag you
+think you deployed.
 
 There is no test suite or linter configured in this repo; the only CI is the image build above.
 
@@ -56,10 +69,11 @@ Jobs longer than ~1h will fail at the result-upload step when the access token e
 
 ## Scene detection: PySceneDetect, not TransNetV2
 
-Despite what `README.md` says, `handler.py`'s `detect_scenes()` uses **PySceneDetect**
+Despite what `README.md` says, scene detection uses **PySceneDetect**
 (`scenedetect.detectors.ContentDetector`), not TransNetV2. Scenes longer than
 `processing.clip_max_duration` (config.yaml) are subdivided so per-clip GPU memory stays bounded.
-`backend/pipeline/scene_detect.py` referenced in `README.md`'s directory tree does not exist.
+It exists twice: `gpu_worker/handler.py` (legacy single-job flow) and `backend/pipeline/scene_detect.py`
+(parallel flow, verbatim port) — change both together.
 
 ## GPU worker weight loading
 
@@ -133,14 +147,15 @@ controls `worker.concurrency`, `worker.timeout_per_clip`, `scene_detection.thres
   `video_file_id` + `drive_access_token` flow, and `README.md`/`DEPLOY.md` reference
   `gpu_worker/download_weights.py`, which does not exist in the checkout.
 - **`data/queue.db`** (SQLite, `backend/pipeline/job_queue.py`) is auto-created at runtime and persists
-  between restarts. Delete it to reset all job state. It tracks per-video status and a `clips` table that is
-  largely vestigial now — clip-level tracking actually happens inside the GPU worker, not in this DB.
-- **`data/` subdirectories** (`uploads/`, `clips/`, `masks/`, `results/`, `final/`) are auto-created by
-  `app.py` / the GPU worker at runtime.
-- The `/api/video/<video_id>/status` endpoint hardcodes `total: 1` and simplified clip counts, since clip
-  progress isn't visible to the local backend during a run — the whole video is one opaque RunPod job.
-- `ffmpeg`/`ffprobe` must be on `PATH` locally for `backend/pipeline/ffmpeg_utils.py` (used for
-  upload-time probing) — the GPU worker installs its own `ffmpeg` via the Dockerfile's `apt-get`.
+  between restarts. Delete it to reset all job state. In the parallel flow the `clips` table is live
+  again: one row per clip with its RunPod job id and status, cleared and recreated per run
+  (`clear_clips`/`create_clips_batch`), and `/api/video/<id>/status` reports real per-clip counts.
+- **`data/` subdirectories** (`uploads/`, `clips/`, `masks/`, `results/`, `final/`) are auto-created at
+  runtime. `data/clips/<video_id>/` is the parallel flow's working dir (split clips + downloaded
+  results), deleted on success, left behind on failure for debugging.
+- `ffmpeg`/`ffprobe` must be on `PATH` locally — the parallel flow re-encodes splits and concats/muxes
+  the final video locally via `backend/pipeline/ffmpeg_utils.py`. The GPU worker installs its own
+  `ffmpeg` via the Dockerfile's `apt-get`.
 - GPU worker Python/CUDA deps are version-pinned tightly and order-dependent in the `Dockerfile` (PyTorch
   cu124 wheel index, then PaddlePaddle-GPU from its own cu118 wheel index, then PaddleOCR 3.x). Recent commit
   history shows several fixes here (PaddleOCR 2.x→3.x API migration, dropping deprecated `use_gpu`,

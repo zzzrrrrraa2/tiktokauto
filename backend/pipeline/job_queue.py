@@ -138,6 +138,12 @@ class JobQueue:
         self._log(video_id, None, "clips_created", f"{len(clip_ids)} clips")
         return clip_ids
 
+    def clear_clips(self, video_id: str):
+        """Remove all clip rows for a video (fresh rows are created per run;
+        stale ones from a previous run with more clips would skew progress)."""
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM clips WHERE video_id=?", (video_id,))
+
     def update_clip_status(self, clip_id: str, status: str, runpod_job_id: str = None,
                            result_path: str = None, error_message: str = None):
         with self._get_conn() as conn:
