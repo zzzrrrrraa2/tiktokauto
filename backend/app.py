@@ -4,7 +4,6 @@ import threading
 import time
 import uuid
 import yaml
-import shutil
 import requests
 import io
 import json
@@ -51,11 +50,22 @@ TOKEN_PATH = DATA_DIR / "drive_token.json"
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
-def _get_drive_service():
+def _get_drive_creds():
     creds = None
     if TOKEN_PATH.exists():
         with open(TOKEN_PATH) as f:
             creds = Credentials.from_authorized_user_info(json.load(f), SCOPES)
+
+    # Always refresh when possible: the access token is handed to the GPU worker,
+    # which needs it to stay valid for the whole job (~1h lifetime from refresh).
+    if creds and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(TOKEN_PATH, "w") as f:
+                f.write(creds.to_json())
+        except Exception:
+            pass
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -77,24 +87,43 @@ def _get_drive_service():
         with open(TOKEN_PATH, "w") as f:
             f.write(creds.to_json())
 
-    return build("drive", "v3", credentials=creds)
+    return creds
 
 
-def upload_to_drive(file_path: str, filename: str) -> str:
-    """Upload a file to Google Drive, make it publicly readable, return direct download URL."""
-    service = _get_drive_service()
+def _get_drive_service(creds=None):
+    return build("drive", "v3", credentials=creds or _get_drive_creds())
+
+
+def upload_to_drive(file_path: str, filename: str, creds=None) -> str:
+    """Upload a file to Google Drive (kept private). Returns the file id."""
+    service = _get_drive_service(creds)
 
     with open(file_path, "rb") as fh:
         media = MediaIoBaseUpload(io.BytesIO(fh.read()), mimetype="video/mp4", resumable=True)
         file_metadata = {"name": filename}
         uploaded = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
 
-    file_id = uploaded["id"]
+    return uploaded["id"]
 
-    permission = {"type": "anyone", "role": "reader"}
-    service.permissions().create(fileId=file_id, body=permission).execute()
 
-    return f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
+def download_from_drive(file_id: str, dest_path: str, creds):
+    """Stream a Drive file to disk using the OAuth access token."""
+    resp = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+        headers={"Authorization": f"Bearer {creds.token}"},
+        stream=True, timeout=600
+    )
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            f.write(chunk)
+
+
+def delete_from_drive(file_id: str, creds):
+    try:
+        _get_drive_service(creds).files().delete(fileId=file_id).execute()
+    except Exception:
+        pass  # cleanup is best-effort; orphaned files only cost Drive quota
 
 
 def process_video_pipeline(video_id: str):
@@ -122,50 +151,48 @@ def process_video_pipeline(video_id: str):
         file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
         log(f"Uploading video to Google Drive: {video_path} ({file_size_mb:.1f} MB)")
 
-        video_download_url = upload_to_drive(video_path, f"{video_id}.mp4")
-        log(f"Uploaded — download URL: {video_download_url}")
+        creds = _get_drive_creds()
+        video_file_id = upload_to_drive(video_path, f"{video_id}.mp4", creds)
+        log(f"Uploaded — Drive file id: {video_file_id}")
 
         payload = {
-            "video_download_url": video_download_url,
+            "video_file_id": video_file_id,
+            "drive_access_token": creds.token,
             "roi": roi,
-            "fps": video["fps"],
             "video_id": video_id,
             "mask_dilation": config["processing"]["mask_dilation"],
             "scene_threshold": config["scene_detection"]["threshold"],
-            "min_scene_length": config["scene_detection"]["min_scene_length"]
+            "min_scene_length": config["scene_detection"]["min_scene_length"],
+            "max_clip_duration": config["processing"]["clip_max_duration"]
         }
-        log(f"Sending to RunPod — timeout={config['worker']['timeout_per_clip'] * 20}s")
+        timeout = config["worker"]["timeout_per_clip"] * 20
+        log(f"Sending to RunPod — timeout={timeout}s")
 
-        result = runpod.run_sync(
-            payload,
-            timeout=config["worker"]["timeout_per_clip"] * 20
-        )
+        try:
+            result = runpod.run_sync(payload, timeout=timeout)
+        finally:
+            delete_from_drive(video_file_id, creds)
         log(f"RunPod response received — keys={list(result.keys()) if result else 'None'}")
 
-        result_path = result.get("result_path", "")
-        if result_path:
-            log(f"Result path: {result_path}")
-            final_dir = str(DATA_DIR / "final")
-            os.makedirs(final_dir, exist_ok=True)
-            final_path = str(DATA_DIR / "final" / f"{video_id}_final.mp4")
+        if result and result.get("error"):
+            raise RuntimeError(f"GPU worker error: {result['error']}")
 
-            if os.path.exists(result_path):
-                log(f"Copying result from local path: {result_path}")
-                shutil.copy(result_path, final_path)
-            else:
-                log(f"Downloading result from URL: {result_path}")
-                resp = requests.get(result_path, stream=True, timeout=300)
-                resp.raise_for_status()
-                with open(final_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
+        result_file_id = (result or {}).get("result_file_id", "")
+        if result_file_id:
+            final_dir = DATA_DIR / "final"
+            final_dir.mkdir(parents=True, exist_ok=True)
+            final_path = str(final_dir / f"{video_id}_final.mp4")
+
+            log(f"Downloading result from Drive (file id {result_file_id})")
+            download_from_drive(result_file_id, final_path, creds)
+            delete_from_drive(result_file_id, creds)
 
             log(f"Pipeline complete — result saved to {final_path}")
             queue.set_video_result(video_id, final_path)
         else:
-            log("ERROR: no result_path in RunPod response")
+            log("ERROR: no result_file_id in RunPod response")
             queue.update_video_status(video_id, "failed")
-            queue._log(video_id, None, "pipeline_error", "No result path from GPU worker")
+            queue._log(video_id, None, "pipeline_error", "No result file id from GPU worker")
 
     except Exception as e:
         log(f"ERROR: {e}")

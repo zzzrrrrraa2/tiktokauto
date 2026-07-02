@@ -32,7 +32,7 @@ paths:
   results: "./data/results"
   final: "./data/final"
 
-# Scene Detection (TransNetV2)
+# Scene Detection (PySceneDetect ContentDetector)
 scene_detection:
   min_scene_length: 1.5  # Minimum scene duration in seconds
   threshold: 20.0  # Detection sensitivity (lower = more cuts)

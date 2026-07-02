@@ -50,6 +50,20 @@ RUN pip install --no-cache-dir runpod
 
 RUN git clone --depth 1 https://github.com/sczhou/ProPainter.git /app/propainter_repo
 
+# Bake ProPainter weights into the image so cold starts don't depend on GitHub
+RUN mkdir -p /app/weights/propainter \
+    && wget -q -O /app/weights/propainter/ProPainter.pth \
+       https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth \
+    && wget -q -O /app/weights/propainter/raft-things.pth \
+       https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth \
+    && wget -q -O /app/weights/propainter/recurrent_flow_completion.pth \
+       https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth
+
+# Pre-download PaddleOCR models at build time (CPU device — no GPU during build).
+# The same model files are reused by the GPU runtime, so cold starts skip the download.
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(device='cpu', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, lang='en')" \
+    || echo "PaddleOCR model prefetch failed — models will download on first cold start instead"
+
 COPY handler.py .
 
 CMD ["python", "-u", "handler.py"]

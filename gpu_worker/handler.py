@@ -1,28 +1,40 @@
 #!/usr/bin/env python3
 """RunPod Serverless Handler — Full Video Caption Removal Pipeline.
 
-Receives: {video_data_b64 or video_download_url or video_path, roi: {x,y,w,h}, fps, video_id, mask_dilation, scene_threshold, min_scene_length}
+Input payload:
+  {
+    "video_file_id": "<Google Drive file id>",        # preferred (with drive_access_token)
+    "drive_access_token": "<short-lived OAuth token>", # used to download input + upload result
+    "video_download_url" | "video_data_b64" | "video_path": ...,  # fallbacks / manual testing
+    "roi": {"x", "y", "w", "h"},                       # caption region in source pixel coords
+    "video_id": str,
+    "mask_dilation": int,
+    "scene_threshold": float,
+    "min_scene_length": float,
+    "max_clip_duration": float
+  }
 
 Pipeline (all on GPU):
-  1. PySceneDetect → detect scene boundaries
-  2. ffmpeg → split video into clips
-  3. Per clip: PaddleOCR → mask generation → ProPainter inpainting
-  4. ffmpeg → concatenate all clips
-  5. Return result video path
+  1. PySceneDetect → scene boundaries (capped at max_clip_duration per clip)
+  2. ffmpeg → split video into frame-accurate clips (video only, re-encoded)
+  3. Per clip: PaddleOCR on ROI → text masks → ProPainter inpainting on a crop
+     around the ROI only (memory- and speed-bounded), composited back full-res
+  4. ffmpeg → concatenate clips, mux original audio back in
+  5. Upload result to Google Drive (or return base64 for small manual tests)
 """
 
 import os
 import sys
 import json
+import math
 import time
-import subprocess
-import shutil
 import base64
+import shutil
 import fractions
+import subprocess
 import numpy as np
 import cv2
 from PIL import Image
-from pathlib import Path
 import torch
 import torchvision
 import warnings
@@ -50,7 +62,7 @@ def _download_weights():
     for path, url in WEIGHTS_URLS.items():
         if not os.path.exists(path):
             print(f"[GPU_WORKER] Downloading {os.path.basename(path)}...", flush=True)
-            subprocess.run(["wget", "-q", "--show-progress", "-O", path, url], check=True)
+            subprocess.run(["wget", "-q", "-O", path, url], check=True)
             print(f"[GPU_WORKER] Downloaded {os.path.basename(path)} ({os.path.getsize(path) / 1024**2:.1f} MB)", flush=True)
 
 _download_weights()
@@ -65,6 +77,61 @@ from core.utils import to_tensors
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_HALF = DEVICE.type == "cuda"
 
+DRIVE_API = "https://www.googleapis.com/drive/v3"
+DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
+
+# Inpainting crop margin around the ROI. Must comfortably exceed total mask
+# dilation (pre-dilation + ProPainter flow dilation ≈ 1.5 * mask_dilation px).
+CROP_MARGIN = 96
+CROP_MIN_SIZE = 160
+
+
+# ---------------------------------------------------------------------------
+# Google Drive transfer (plain REST — no client libraries needed on the worker)
+# ---------------------------------------------------------------------------
+
+def drive_download(file_id: str, token: str, dest_path: str):
+    import requests as req
+    with req.get(f"{DRIVE_API}/files/{file_id}?alt=media",
+                 headers={"Authorization": f"Bearer {token}"},
+                 stream=True, timeout=600) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+
+
+def drive_upload(file_path: str, name: str, token: str) -> str:
+    """Resumable upload; returns the new file id."""
+    import requests as req
+    size = os.path.getsize(file_path)
+    r = req.post(
+        f"{DRIVE_UPLOAD}?uploadType=resumable&fields=id",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "video/mp4",
+            "X-Upload-Content-Length": str(size),
+        },
+        json={"name": name},
+        timeout=60,
+    )
+    r.raise_for_status()
+    session_url = r.headers["Location"]
+    with open(file_path, "rb") as f:
+        r2 = req.put(
+            session_url,
+            data=f,
+            headers={"Content-Type": "video/mp4", "Content-Length": str(size)},
+            timeout=1800,
+        )
+    r2.raise_for_status()
+    return r2.json()["id"]
+
+
+# ---------------------------------------------------------------------------
+# Video utilities
+# ---------------------------------------------------------------------------
 
 def probe_video(video_path: str) -> dict:
     cmd = [
@@ -78,6 +145,8 @@ def probe_video(video_path: str) -> dict:
         if stream.get("codec_type") == "video":
             video_stream = stream
             break
+    if video_stream is None:
+        raise ValueError(f"No video stream in {video_path}")
     return {
         "width": int(video_stream["width"]),
         "height": int(video_stream["height"]),
@@ -87,35 +156,52 @@ def probe_video(video_path: str) -> dict:
 
 
 def detect_scenes(video_path: str, threshold: float = 27.0,
-                   min_scene_length: float = 1.5) -> list[float]:
-    """Detect scene boundaries using PySceneDetect. Returns list of cut timestamps."""
+                  min_scene_length: float = 1.5) -> list:
+    """Detect scene boundaries with PySceneDetect. Returns sorted cut timestamps
+    always starting at 0.0 and ending at the video duration — a video with no
+    cuts yields [0.0, duration]."""
     from scenedetect import open_video, SceneManager
     from scenedetect.detectors import ContentDetector
+
+    duration = probe_video(video_path)["duration"]
 
     video = open_video(video_path)
     scene_manager = SceneManager()
     scene_manager.add_detector(ContentDetector(threshold=threshold))
     scene_manager.detect_scenes(video)
-
     scene_list = scene_manager.get_scene_list()
+
     cuts = [0.0]
-    for start, end in scene_list:
-        cuts.append(end.get_seconds())
-
-    fps = probe_video(video_path)["fps"]
-    min_frames = int(min_scene_length * fps)
-    merged = [cuts[0]]
-    for i in range(1, len(cuts) - 1):
-        if (cuts[i] - merged[-1]) * fps >= min_frames:
-            merged.append(cuts[i])
-    merged.append(cuts[-1])
-
-    return merged
+    for _start, end in scene_list:
+        t = end.get_seconds()
+        if t - cuts[-1] >= min_scene_length and t < duration - 0.05:
+            cuts.append(t)
+    cuts.append(duration)
+    # Merge a trailing scene shorter than the minimum into its predecessor
+    if len(cuts) > 2 and cuts[-1] - cuts[-2] < min_scene_length:
+        del cuts[-2]
+    return cuts
 
 
-def split_video(input_path: str, segments: list[tuple[float, float]],
-                output_dir: str) -> list[str]:
-    """Split video into clips. Returns clip paths."""
+def subdivide_segments(segments: list, max_duration: float) -> list:
+    """Split any segment longer than max_duration into equal-length chunks
+    so per-clip memory stays bounded."""
+    out = []
+    for start, end in segments:
+        d = end - start
+        if d <= max_duration + 0.01:
+            out.append((start, end))
+            continue
+        n = math.ceil(d / max_duration)
+        step = d / n
+        for i in range(n):
+            out.append((start + i * step, min(end, start + (i + 1) * step)))
+    return out
+
+
+def split_video(input_path: str, segments: list, output_dir: str, fps: float) -> list:
+    """Split video into frame-accurate clips (re-encoded, video-only).
+    Audio is muxed back from the original after concatenation."""
     os.makedirs(output_dir, exist_ok=True)
     clip_paths = []
     for i, (start, end) in enumerate(segments):
@@ -123,20 +209,23 @@ def split_video(input_path: str, segments: list[tuple[float, float]],
         clip_path = os.path.join(output_dir, f"clip_{i+1:04d}.mp4")
         cmd = [
             "ffmpeg", "-y",
-            "-ss", str(start),
+            "-ss", f"{start:.3f}",
             "-i", input_path,
-            "-t", str(duration),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
+            "-t", f"{duration:.3f}",
+            "-an",
+            "-vsync", "cfr", "-r", f"{fps}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
             clip_path
         ]
-        subprocess.run(cmd, capture_output=True, check=True)
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg split failed for segment {i}: {proc.stderr.decode(errors='replace')[-2000:]}")
         clip_paths.append(clip_path)
     return clip_paths
 
 
-def concat_clips(clip_paths: list[str], output_path: str):
-    """Concatenate clips using ffmpeg concat demuxer."""
+def concat_clips(clip_paths: list, output_path: str):
     concat_file = os.path.join(os.path.dirname(output_path), "_concat_list.txt")
     with open(concat_file, "w") as f:
         for path in clip_paths:
@@ -148,79 +237,122 @@ def concat_clips(clip_paths: list[str], output_path: str):
         "-c", "copy",
         output_path
     ]
-    subprocess.run(cmd, capture_output=True, check=True)
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg concat failed: {proc.stderr.decode(errors='replace')[-2000:]}")
     os.remove(concat_file)
 
 
-def load_frames_as_pil(video_path: str) -> tuple:
-    vframes, aframes, info = torchvision.io.read_video(
-        filename=video_path, pts_unit="sec"
+def mux_audio(video_path: str, audio_source_path: str, output_path: str):
+    """Copy the processed video stream and add the original audio (if any)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_source_path,
+        "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart",
+        output_path
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg audio mux failed: {proc.stderr.decode(errors='replace')[-2000:]}")
+
+
+def load_video_frames(video_path: str):
+    """Returns (frames THWC uint8 numpy array, fps)."""
+    vframes, _aframes, info = torchvision.io.read_video(
+        filename=video_path, pts_unit="sec", output_format="THWC"
     )
-    frames = [Image.fromarray(f.numpy()) for f in vframes]
-    fps = info["video_fps"]
-    return frames, fps
+    return vframes.numpy(), float(info["video_fps"])
 
 
-def run_ocr(frames: list, roi: dict) -> list:
-    """Run PaddleOCR on keyframes within ROI. Returns list of mask arrays."""
-    try:
+def write_video(frames, fps: float, output_path: str):
+    import imageio
+    imageio.mimwrite(
+        output_path, frames, fps=fps,
+        codec="libx264", quality=8,
+        pixelformat="yuv420p", macro_block_size=2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OCR → text masks
+# ---------------------------------------------------------------------------
+
+_OCR = None
+
+
+def _get_ocr():
+    global _OCR
+    if _OCR is None:
         from paddleocr import PaddleOCR
+        _OCR = PaddleOCR(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            lang="en",
+            text_det_thresh=0.3,
+            text_det_box_thresh=0.4,
+            text_det_unclip_ratio=1.5
+        )
+    return _OCR
+
+
+def clamp_roi(roi: dict, width: int, height: int) -> dict:
+    x = min(max(int(roi["x"]), 0), max(0, width - 1))
+    y = min(max(int(roi["y"]), 0), max(0, height - 1))
+    w = max(1, min(int(roi["w"]), width - x))
+    h = max(1, min(int(roi["h"]), height - y))
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def run_ocr(frames, roi: dict) -> list:
+    """Run PaddleOCR text detection on keyframes within the ROI.
+    Returns one full-frame uint8 mask (0/255) per frame."""
+    try:
+        ocr = _get_ocr()
     except ImportError:
         return _fallback_text_detection(frames, roi)
-
-    ocr = PaddleOCR(
-        use_textline_orientation=False,
-        lang="en",
-        text_det_thresh=0.3,
-        text_det_box_thresh=0.4,
-        text_det_unclip_ratio=1.5
-    )
 
     x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
     mask_frames = []
     ocr_step = 5
     last_mask = None
 
-    for i, frame in enumerate(frames):
-        frame_np = np.array(frame)
-        mask = np.zeros((frame_np.shape[0], frame_np.shape[1]), dtype=np.uint8)
-        roi_region = frame_np[y:y+h, x:x+w]
-
-        if roi_region.size == 0:
-            mask_frames.append(mask)
-            continue
+    for i in range(len(frames)):
+        frame_np = frames[i]
+        mask = np.zeros(frame_np.shape[:2], dtype=np.uint8)
 
         if i % ocr_step == 0:
-            result = ocr.ocr(roi_region, cls=False)
-            last_mask = mask.copy()
-            if result and result[0]:
-                for line in result[0]:
-                    box = line[0]
-                    box = np.array(box).astype(np.int32)
+            roi_bgr = cv2.cvtColor(frame_np[y:y+h, x:x+w], cv2.COLOR_RGB2BGR)
+            result = ocr.predict(roi_bgr)
+            for res in result or []:
+                polys = res.get("dt_polys") if hasattr(res, "get") else None
+                if polys is None:
+                    continue
+                for box in polys:
+                    box = np.asarray(box, dtype=np.int32).reshape(-1, 2)
                     box[:, 0] += x
                     box[:, 1] += y
                     cv2.fillPoly(mask, [box], 255)
-                    cv2.fillPoly(last_mask, [box], 255)
-            mask_frames.append(mask)
+            last_mask = mask
         elif last_mask is not None:
-            mask_frames.append(last_mask.copy())
-        else:
-            mask_frames.append(mask)
+            mask = last_mask.copy()
+
+        mask_frames.append(mask)
 
     return mask_frames
 
 
-def _fallback_text_detection(frames: list, roi: dict) -> list:
+def _fallback_text_detection(frames, roi: dict) -> list:
     x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
     mask_frames = []
 
-    for frame in frames:
-        frame_np = np.array(frame)
-        mask = np.zeros((frame_np.shape[0], frame_np.shape[1]), dtype=np.uint8)
+    for i in range(len(frames)):
+        frame_np = frames[i]
+        mask = np.zeros(frame_np.shape[:2], dtype=np.uint8)
         roi_region = frame_np[y:y+h, x:x+w]
-        if roi_region.size == 0:
-            mask_frames.append(mask)
-            continue
 
         gray = cv2.cvtColor(roi_region, cv2.COLOR_RGB2GRAY)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -231,57 +363,55 @@ def _fallback_text_detection(frames: list, roi: dict) -> list:
         for cnt in contours:
             cx, cy, cw, ch = cv2.boundingRect(cnt)
             if cw > 30 and ch > 8:
-                cv2.rectangle(mask,
-                    (x + cx, y + cy),
-                    (x + cx + cw, y + cy + ch),
-                    255, -1)
+                cv2.rectangle(mask, (x + cx, y + cy), (x + cx + cw, y + cy + ch), 255, -1)
 
         mask_frames.append(mask)
 
     return mask_frames
 
 
-def dilate_masks(masks: list, iterations: int = 4) -> list:
-    import scipy.ndimage
-    dilated = []
-    for mask in masks:
-        if iterations > 0:
-            d = scipy.ndimage.binary_dilation(mask, iterations=iterations).astype(np.uint8)
-        else:
-            d = (mask > 0).astype(np.uint8)
-        dilated.append(Image.fromarray(d * 255))
-    return dilated
+# ---------------------------------------------------------------------------
+# ProPainter inpainting (on a crop around the ROI)
+# ---------------------------------------------------------------------------
+
+def compute_crop_box(roi: dict, width: int, height: int,
+                     margin: int = CROP_MARGIN, min_size: int = CROP_MIN_SIZE):
+    """Crop window covering ROI + margin, dimensions multiples of 8,
+    clamped to the frame. Returns (x0, y0, x1, y1)."""
+    def fit(lo, hi, limit):
+        lo = max(0, lo - margin)
+        hi = min(limit, hi + margin)
+        size = max(hi - lo, min(min_size, limit))
+        size = min(size, limit)
+        size -= size % 8
+        lo = max(0, min(lo, limit - size))
+        return lo, lo + size
+
+    x0, x1 = fit(roi["x"], roi["x"] + roi["w"], width)
+    y0, y1 = fit(roi["y"], roi["y"] + roi["h"], height)
+    return x0, y0, x1, y1
 
 
-def run_propainter(clip_path: str, mask_dir: str, output_dir: str,
+def run_propainter(crop_frames: list, crop_masks: list,
                    fix_raft, fix_flow_complete, model,
-                   mask_dilation: int = 8) -> str:
-    """Run ProPainter inpainting. Returns result video path."""
-    frames, fps = load_frames_as_pil(clip_path)
-    video_length = len(frames)
+                   mask_dilation: int = 8) -> list:
+    """Inpaint masked regions. crop_frames: PIL RGB images, crop_masks: PIL L
+    masks — all the same size with dimensions divisible by 8.
+    Returns the completed frames as uint8 numpy arrays."""
+    video_length = len(crop_frames)
+    w, h = crop_frames[0].size
 
-    h, w = frames[0].size[1], frames[0].size[0]
-    process_h = h - h % 8
-    process_w = w - w % 8
-    frames = [f.resize((process_w, process_h)) for f in frames]
-
-    mask_files = sorted(Path(mask_dir).glob("*.png"))
-    masks_pil = [Image.open(p).convert("L").resize((process_w, process_h), Image.NEAREST)
-                 for p in mask_files]
-
-    import scipy.ndimage
-    flow_masks = []
+    kernel = np.ones((3, 3), np.uint8)
     masks_dilated = []
-    for m in masks_pil:
-        m_arr = np.array(m)
-        flow_m = scipy.ndimage.binary_dilation(m_arr, iterations=mask_dilation).astype(np.uint8)
-        flow_masks.append(Image.fromarray(flow_m * 255))
-        dilated_m = scipy.ndimage.binary_dilation(m_arr, iterations=mask_dilation).astype(np.uint8)
-        masks_dilated.append(Image.fromarray(dilated_m * 255))
+    for m in crop_masks:
+        arr = np.array(m)
+        if mask_dilation > 0:
+            arr = cv2.dilate(arr, kernel, iterations=mask_dilation)
+        masks_dilated.append(Image.fromarray(((arr > 0) * 255).astype(np.uint8)))
 
-    frames_t = to_tensors()(frames).unsqueeze(0) * 2 - 1
-    flow_masks_t = to_tensors()(flow_masks).unsqueeze(0)
-    masks_dilated_t = to_tensors()(masks_dilated).unsqueeze(0)
+    frames_t = to_tensors()(crop_frames).unsqueeze(0) * 2 - 1
+    flow_masks_t = to_tensors()(masks_dilated).unsqueeze(0)
+    masks_dilated_t = flow_masks_t
     frames_t = frames_t.to(DEVICE)
     flow_masks_t = flow_masks_t.to(DEVICE)
     masks_dilated_t = masks_dilated_t.to(DEVICE)
@@ -319,7 +449,7 @@ def run_propainter(clip_path: str, mask_dir: str, output_dir: str,
         if USE_HALF:
             frames_t = frames_t.half()
             flow_masks_t = flow_masks_t.half()
-            masks_dilated_t = masks_dilated_t.half()
+            masks_dilated_t = flow_masks_t
             gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
             fix_flow_complete = fix_flow_complete.half()
             model = model.half()
@@ -382,7 +512,7 @@ def run_propainter(clip_path: str, mask_dir: str, output_dir: str,
             updated_masks = updated_local_masks.view(b, t, 1, h, w)
             torch.cuda.empty_cache()
 
-    ori_frames = [np.array(f).astype(np.uint8) for f in frames]
+    ori_frames = [np.array(f).astype(np.uint8) for f in crop_frames]
     comp_frames = [None] * video_length
     neighbor_stride = neighbor_length // 2
 
@@ -394,7 +524,7 @@ def run_propainter(clip_path: str, mask_dir: str, output_dir: str,
     for f in range(0, video_length, neighbor_stride):
         neighbor_ids = [
             i for i in range(max(0, f - neighbor_stride),
-                            min(video_length, f + neighbor_stride + 1))
+                             min(video_length, f + neighbor_stride + 1))
         ]
         ref_ids = []
         if ref_num == -1:
@@ -421,7 +551,7 @@ def run_propainter(clip_path: str, mask_dir: str, output_dir: str,
         with torch.no_grad():
             l_t = len(neighbor_ids)
             pred_img = model(selected_imgs, selected_pred_flows_bi,
-                           selected_masks, selected_update_masks, l_t)
+                             selected_masks, selected_update_masks, l_t)
             pred_img = pred_img.view(-1, 3, h, w)
             pred_img = (pred_img + 1) / 2
             pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
@@ -440,40 +570,44 @@ def run_propainter(clip_path: str, mask_dir: str, output_dir: str,
 
         torch.cuda.empty_cache()
 
-    os.makedirs(output_dir, exist_ok=True)
-    result_path = os.path.join(output_dir, "inpaint_out.mp4")
-
-    import imageio
-    imageio.mimwrite(result_path, comp_frames, fps=fps, quality=7)
-
-    return result_path
+    return comp_frames
 
 
 def process_clip(clip_path: str, roi: dict, clip_id: str, mask_dilation: int,
                  fix_raft, fix_flow_complete, propainter_model,
-                 work_dir: str) -> str:
-    """Full processing of a single clip: OCR → mask → ProPainter."""
-    clip_work = os.path.join(work_dir, clip_id)
-    os.makedirs(clip_work, exist_ok=True)
+                 work_dir: str, log) -> str:
+    """Full processing of a single clip: OCR → mask → crop → ProPainter → composite."""
+    frames, fps = load_video_frames(clip_path)
+    n, frame_h, frame_w = frames.shape[0], frames.shape[1], frames.shape[2]
 
-    frames, fps = load_frames_as_pil(clip_path)
+    roi_c = clamp_roi(roi, frame_w, frame_h)
+    masks = run_ocr(frames, roi_c)
 
-    mask_arrays = run_ocr(frames, roi)
-    masks_pil = dilate_masks(mask_arrays, iterations=mask_dilation // 2)
+    pre_dilate = max(1, mask_dilation // 2)
+    kernel = np.ones((3, 3), np.uint8)
+    masks = [cv2.dilate(m, kernel, iterations=pre_dilate) if m.any() else m for m in masks]
 
-    mask_dir = os.path.join(clip_work, "masks")
-    os.makedirs(mask_dir, exist_ok=True)
-    for i, m in enumerate(masks_pil):
-        m.save(os.path.join(mask_dir, f"mask_{i:06d}.png"))
+    result_path = os.path.join(work_dir, f"{clip_id}_out.mp4")
 
-    output_dir = os.path.join(clip_work, "output")
-    result_path = run_propainter(
-        clip_path, mask_dir, output_dir,
-        fix_raft, fix_flow_complete, propainter_model,
-        mask_dilation=mask_dilation
-    )
+    has_text = any(m.any() for m in masks)
+    if has_text and n >= 2:
+        x0, y0, x1, y1 = compute_crop_box(roi_c, frame_w, frame_h)
+        log(f"{clip_id}: {n} frames, inpainting crop ({x0},{y0})-({x1},{y1})")
+        crop_frames = [Image.fromarray(frames[i, y0:y1, x0:x1]) for i in range(n)]
+        crop_masks = [Image.fromarray(masks[i][y0:y1, x0:x1]) for i in range(n)]
+        comp_frames = run_propainter(
+            crop_frames, crop_masks,
+            fix_raft, fix_flow_complete, propainter_model,
+            mask_dilation=mask_dilation
+        )
+        for i in range(n):
+            frames[i, y0:y1, x0:x1] = comp_frames[i]
+        del crop_frames, crop_masks, comp_frames
+        torch.cuda.empty_cache()
+    else:
+        log(f"{clip_id}: {n} frames, no text detected — passing through")
 
-    torch.cuda.empty_cache()
+    write_video(frames, fps, result_path)
     return result_path
 
 
@@ -510,97 +644,133 @@ def handler(job):
     log(f"Handler invoked — input keys: {list(job_input.keys())}")
 
     roi = job_input["roi"]
-    mask_dilation = job_input.get("mask_dilation", 8)
-    scene_threshold = job_input.get("scene_threshold", 27.0)
-    min_scene_length = job_input.get("min_scene_length", 1.5)
-    log(f"Params — roi={roi} mask_dilation={mask_dilation} scene_threshold={scene_threshold} min_scene_length={min_scene_length}")
+    mask_dilation = int(job_input.get("mask_dilation", 8))
+    scene_threshold = float(job_input.get("scene_threshold", 27.0))
+    min_scene_length = float(job_input.get("min_scene_length", 1.5))
+    max_clip_duration = float(job_input.get("max_clip_duration", 12.0))
+    drive_token = job_input.get("drive_access_token", "")
+    log(f"Params — roi={roi} mask_dilation={mask_dilation} scene_threshold={scene_threshold} "
+        f"min_scene_length={min_scene_length} max_clip_duration={max_clip_duration} "
+        f"drive_token={'yes' if drive_token else 'no'}")
 
-    video_data_b64 = job_input.get("video_data_b64", "")
+    # --- Acquire the source video ---------------------------------------
+    video_file_id = job_input.get("video_file_id", "")
     video_download_url = job_input.get("video_download_url", "")
+    video_data_b64 = job_input.get("video_data_b64", "")
+    downloaded = False
 
-    if video_data_b64:
-        b64_len = len(video_data_b64)
-        log(f"Decoding base64 video ({b64_len} chars)...")
+    if video_file_id and drive_token:
         video_path = os.path.join("/tmp", f"{video_id}_{int(time.time())}.mp4")
-        with open(video_path, "wb") as f:
-            f.write(base64.b64decode(video_data_b64))
-        file_size = os.path.getsize(video_path) / (1024 * 1024)
-        log(f"Video decoded to {video_path} ({file_size:.1f} MB)")
+        log(f"Downloading video from Drive (file id {video_file_id})...")
+        drive_download(video_file_id, drive_token, video_path)
+        downloaded = True
     elif video_download_url:
-        log(f"Downloading video from URL: {video_download_url}")
         video_path = os.path.join("/tmp", f"{video_id}_{int(time.time())}.mp4")
+        log(f"Downloading video from URL: {video_download_url}")
         import requests as req
         resp = req.get(video_download_url, stream=True, timeout=300)
         resp.raise_for_status()
         with open(video_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
                 f.write(chunk)
-        file_size = os.path.getsize(video_path) / (1024 * 1024)
-        log(f"Video downloaded to {video_path} ({file_size:.1f} MB)")
+        downloaded = True
+    elif video_data_b64:
+        video_path = os.path.join("/tmp", f"{video_id}_{int(time.time())}.mp4")
+        log(f"Decoding base64 video ({len(video_data_b64)} chars)...")
+        with open(video_path, "wb") as f:
+            f.write(base64.b64decode(video_data_b64))
+        downloaded = True
     else:
         video_path = job_input.get("video_path", "")
         log(f"Using direct video_path: {video_path}")
 
     if not video_path or not os.path.exists(video_path):
-        log(f"ERROR: Video file not found at {video_path}")
         return {"error": f"Video file not found: {video_path}"}
+    log(f"Source video ready: {video_path} ({os.path.getsize(video_path) / 1024**2:.1f} MB)")
 
-    work_dir = f"/tmp/{video_id}"
+    work_dir = os.path.join("/tmp", f"work_{video_id}_{int(time.time())}")
     os.makedirs(work_dir, exist_ok=True)
 
-    log("Loading ProPainter models...")
-    init_models()
-    log("Models loaded")
+    try:
+        log("Loading ProPainter models...")
+        init_models()
+        log("Models loaded")
 
-    t_start = time.time()
+        t_start = time.time()
+        info = probe_video(video_path)
+        fps = info["fps"]
 
-    # Step 1: Scene detection
-    log("Step 1: Scene detection...")
-    cuts = detect_scenes(video_path, threshold=scene_threshold,
-                         min_scene_length=min_scene_length)
-    segments = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
-    log(f"Scene detection done — {len(cuts)-1} cuts found, {len(segments)} segments")
+        # Step 1: scene detection
+        log("Step 1: Scene detection...")
+        cuts = detect_scenes(video_path, threshold=scene_threshold,
+                             min_scene_length=min_scene_length)
+        segments = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
+        segments = subdivide_segments(segments, max_clip_duration)
+        log(f"Scene detection done — {len(segments)} segments (after max-duration split)")
 
-    # Step 2: Split video into clips
-    log("Step 2: Splitting video into clips...")
-    clip_dir = os.path.join(work_dir, "clips")
-    clip_paths = split_video(video_path, segments, clip_dir)
-    log(f"Splitting done — {len(clip_paths)} clips created")
+        # Step 2: split into clips
+        log("Step 2: Splitting video into clips...")
+        clip_dir = os.path.join(work_dir, "clips")
+        clip_paths = split_video(video_path, segments, clip_dir, fps)
+        log(f"Splitting done — {len(clip_paths)} clips created")
 
-    # Step 3: Process each clip
-    result_clips = []
-    for i, clip_path in enumerate(clip_paths):
-        clip_id = f"clip_{i+1:04d}"
-        clip_size = os.path.getsize(clip_path) / (1024 * 1024)
-        log(f"Step 3.{i+1}/{len(clip_paths)}: Processing clip {clip_id} ({clip_size:.1f} MB)...")
-        t_clip = time.time()
-        result_path = process_clip(
-            clip_path, roi, clip_id, mask_dilation,
-            fix_raft, fix_flow_complete, propainter_model,
-            work_dir
-        )
-        log(f"Clip {clip_id} done in {time.time() - t_clip:.1f}s")
-        result_clips.append(result_path)
+        # Step 3: process each clip
+        result_clips = []
+        for i, clip_path in enumerate(clip_paths):
+            clip_id = f"clip_{i+1:04d}"
+            log(f"Step 3.{i+1}/{len(clip_paths)}: Processing {clip_id}...")
+            t_clip = time.time()
+            result_path = process_clip(
+                clip_path, roi, clip_id, mask_dilation,
+                fix_raft, fix_flow_complete, propainter_model,
+                work_dir, log
+            )
+            log(f"{clip_id} done in {time.time() - t_clip:.1f}s")
+            result_clips.append(result_path)
 
-    # Step 4: Concatenate results
-    log("Step 4: Concatenating clips...")
-    final_path = os.path.join(work_dir, "final.mp4")
-    concat_clips(result_clips, final_path)
-    final_size = os.path.getsize(final_path) / (1024 * 1024)
-    log(f"Concatenation done — final video: {final_path} ({final_size:.1f} MB)")
+        # Step 4: concatenate + restore audio
+        log("Step 4: Concatenating clips and muxing audio...")
+        video_only_path = os.path.join(work_dir, "video_only.mp4")
+        concat_clips(result_clips, video_only_path)
+        final_path = os.path.join(work_dir, "final.mp4")
+        mux_audio(video_only_path, video_path, final_path)
+        final_size = os.path.getsize(final_path)
+        log(f"Final video ready ({final_size / 1024**2:.1f} MB)")
 
-    t_total = time.time() - t_start
-    log(f"Pipeline complete — total time: {t_total:.1f}s")
+        t_total = time.time() - t_start
 
-    torch.cuda.empty_cache()
+        # Step 5: deliver the result
+        output = {
+            "video_id": video_id,
+            "num_clips": len(clip_paths),
+            "total_time": round(t_total, 1),
+            "status": "completed",
+        }
+        if drive_token:
+            log("Step 5: Uploading result to Google Drive...")
+            result_name = f"{video_id}_final.mp4"
+            output["result_file_id"] = drive_upload(final_path, result_name, drive_token)
+            output["result_name"] = result_name
+            log(f"Uploaded result — file id {output['result_file_id']}")
+        elif final_size <= 15 * 1024 * 1024:
+            log("Step 5: No Drive token — returning result inline (base64)")
+            with open(final_path, "rb") as f:
+                output["result_b64"] = base64.b64encode(f.read()).decode("ascii")
+        else:
+            return {"error": f"Result is {final_size / 1024**2:.1f} MB — too large to return inline "
+                             "and no drive_access_token was provided"}
 
-    return {
-        "result_path": final_path,
-        "video_id": video_id,
-        "num_clips": len(clip_paths),
-        "total_time": round(t_total, 1),
-        "status": "completed"
-    }
+        log(f"Pipeline complete — total time: {t_total:.1f}s")
+        return output
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if downloaded:
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
