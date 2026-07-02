@@ -91,7 +91,16 @@ CROP_MIN_SIZE = 160
 # extent for its whole lifetime — see run_ocr() for rationale.
 OCR_STEP = 1
 MASK_WINDOW = 5
-OVERSHOOT_SCALE = 1.15
+
+# Per-polygon mask expansion. Horizontal is deliberately much larger than
+# vertical: the DB text detector expands its shrunken text core by a constant
+# offset proportional to text HEIGHT (area*ratio/perimeter ≈ H/2 for wide
+# boxes), so detected boxes systematically clip word sides regardless of word
+# width. Overridable per job via mask_scale_x/mask_scale_y/mask_pad_x inputs
+# (plumbed from config.yaml by the backend — tune there, no image rebuild).
+MASK_SCALE_X = 1.45
+MASK_SCALE_Y = 1.15
+MASK_PAD_X = 8
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +312,7 @@ def _get_ocr(cpu: bool = False):
             lang="en",
             text_det_thresh=0.3,
             text_det_box_thresh=0.4,
-            text_det_unclip_ratio=1.5
+            text_det_unclip_ratio=2.0
         )
         if cpu:
             kwargs["device"] = "cpu"
@@ -336,20 +345,23 @@ def clamp_roi(roi: dict, width: int, height: int) -> dict:
     return {"x": x, "y": y, "w": w, "h": h}
 
 
-def run_ocr(frames, roi: dict) -> list:
+def run_ocr(frames, roi: dict, scale_x: float = MASK_SCALE_X,
+            scale_y: float = MASK_SCALE_Y, pad_x: float = MASK_PAD_X) -> list:
     """Per-word max-extent masking. Returns one full-frame uint8 mask (0/255)
     per frame.
 
     Captions here are fast, animated, one-word pop-ins (~6-12 frames @ 30fps,
     scaling ~0%→110%→100%), and word sizes vary hugely ("readiness" vs "at").
-    OCR runs on every frame's ROI crop; each detected polygon is scaled by
-    OVERSHOOT_SCALE around its own bbox center (matching the pop animation's
-    overshoot). A frame's mask is then the union of detections within
-    MASK_WINDOW frames on either side — a word is only ever MASK_WINDOW frames
-    from its peak-size detection, so every frame of its life (including pop-in/
-    pop-out frames where OCR sees nothing or a tiny box) is masked at the
-    word's biggest extent, while short words get proportionally small holes and
-    caption-free stretches get no mask at all.
+    OCR runs on every frame's ROI crop; each detected polygon is expanded
+    anisotropically around its own bbox center — width by scale_x plus a
+    constant pad_x per side (DB detection under-covers word sides by a
+    roughly constant amount, see the MASK_SCALE_X comment), height by scale_y
+    (covers the pop animation's ~110% overshoot). A frame's mask is then the
+    union of detections within MASK_WINDOW frames on either side — a word is
+    only ever MASK_WINDOW frames from its peak-size detection, so every frame
+    of its life (including pop-in/pop-out frames where OCR sees nothing or a
+    tiny box) is masked at the word's biggest extent, while short words get
+    proportionally small holes and caption-free stretches get no mask at all.
     """
     try:
         import paddleocr  # noqa: F401 — availability check only
@@ -371,8 +383,9 @@ def run_ocr(frames, roi: dict) -> list:
                 continue
             for box in polys:
                 pts = np.asarray(box, dtype=np.float32).reshape(-1, 2)
-                center = (pts.min(axis=0) + pts.max(axis=0)) / 2.0
-                pts = center + (pts - center) * OVERSHOOT_SCALE
+                cx, cy = (pts.min(axis=0) + pts.max(axis=0)) / 2.0
+                pts[:, 0] = cx + (pts[:, 0] - cx) * scale_x + np.sign(pts[:, 0] - cx) * pad_x
+                pts[:, 1] = cy + (pts[:, 1] - cy) * scale_y
                 cv2.fillPoly(roi_masks[i], [np.round(pts).astype(np.int32)], 255)
 
     # Pass 2: per-frame union over the temporal window, embedded full-frame.
@@ -616,13 +629,16 @@ def run_propainter(crop_frames: list, crop_masks: list,
 
 def process_clip(clip_path: str, roi: dict, clip_id: str, mask_dilation: int,
                  fix_raft, fix_flow_complete, propainter_model,
-                 work_dir: str, log) -> str:
+                 work_dir: str, log,
+                 mask_scale_x: float = MASK_SCALE_X,
+                 mask_scale_y: float = MASK_SCALE_Y,
+                 mask_pad_x: float = MASK_PAD_X) -> str:
     """Full processing of a single clip: OCR → mask → crop → ProPainter → composite."""
     frames, fps = load_video_frames(clip_path)
     n, frame_h, frame_w = frames.shape[0], frames.shape[1], frames.shape[2]
 
     roi_c = clamp_roi(roi, frame_w, frame_h)
-    masks = run_ocr(frames, roi_c)
+    masks = run_ocr(frames, roi_c, mask_scale_x, mask_scale_y, mask_pad_x)
 
     pre_dilate = max(1, mask_dilation // 2)
     kernel = np.ones((3, 3), np.uint8)
@@ -702,9 +718,13 @@ def handler(job):
     scene_threshold = float(job_input.get("scene_threshold", 27.0))
     min_scene_length = float(job_input.get("min_scene_length", 1.5))
     max_clip_duration = float(job_input.get("max_clip_duration", 12.0))
+    mask_scale_x = float(job_input.get("mask_scale_x", MASK_SCALE_X))
+    mask_scale_y = float(job_input.get("mask_scale_y", MASK_SCALE_Y))
+    mask_pad_x = float(job_input.get("mask_pad_x", MASK_PAD_X))
     drive_token = job_input.get("drive_access_token", "")
     log(f"Params — roi={roi} mask_dilation={mask_dilation} scene_threshold={scene_threshold} "
         f"min_scene_length={min_scene_length} max_clip_duration={max_clip_duration} "
+        f"mask_scale_x={mask_scale_x} mask_scale_y={mask_scale_y} mask_pad_x={mask_pad_x} "
         f"drive_token={'yes' if drive_token else 'no'}")
 
     # --- Acquire the source video ---------------------------------------
@@ -778,7 +798,9 @@ def handler(job):
             result_path = process_clip(
                 clip_path, roi, clip_id, mask_dilation,
                 fix_raft, fix_flow_complete, propainter_model,
-                work_dir, log
+                work_dir, log,
+                mask_scale_x=mask_scale_x, mask_scale_y=mask_scale_y,
+                mask_pad_x=mask_pad_x
             )
             log(f"{clip_id} done in {time.time() - t_clip:.1f}s")
             result_clips.append(result_path)

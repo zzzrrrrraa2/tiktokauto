@@ -161,6 +161,9 @@ def process_video_pipeline(video_id: str):
             "roi": roi,
             "video_id": video_id,
             "mask_dilation": config["processing"]["mask_dilation"],
+            "mask_scale_x": config["processing"].get("mask_scale_x", 1.45),
+            "mask_scale_y": config["processing"].get("mask_scale_y", 1.15),
+            "mask_pad_x": config["processing"].get("mask_pad_x", 8),
             "scene_threshold": config["scene_detection"]["threshold"],
             "min_scene_length": config["scene_detection"]["min_scene_length"],
             "max_clip_duration": config["processing"]["clip_max_duration"]

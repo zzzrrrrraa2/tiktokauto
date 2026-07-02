@@ -78,13 +78,20 @@ cold start) — the Dockerfile is the source of truth.
   step (`mux_audio`).
 - **OCR → mask is per-word max-extent via a sliding temporal window.** `run_ocr()` OCRs **every** frame's
   BGR ROI crop (`OCR_STEP = 1`) via `ocr.predict()` (PaddleOCR 3.x API — no `cls`/`use_angle_cls`/`use_gpu`
-  params, results read from `res["dt_polys"]`). Each detected polygon is scaled by `OVERSHOOT_SCALE`
-  (1.15×) around its **own** bbox center (captions pop in ~0%→110%→100%), and a frame's mask is the union
-  of detections within `MASK_WINDOW` (±5) frames. Rationale: captions are one-word pop-ins living ~6-12
-  frames @ 30fps, so every frame of a word's life — including pop-in/out frames OCR can't see — is within
-  the window of its peak-size detection and gets masked at the word's biggest extent, while short words
-  ("at") get small holes, long words ("readiness") wide ones, and caption-free stretches no mask at all.
+  params, results read from `res["dt_polys"]`), and a frame's mask is the union of detections within
+  `MASK_WINDOW` (±5) frames. Rationale: captions are one-word pop-ins living ~6-12 frames @ 30fps, so
+  every frame of a word's life — including pop-in/out frames OCR can't see — is within the window of its
+  peak-size detection and gets masked at the word's biggest extent, while short words ("at") get small
+  holes, long words ("readiness") wide ones, and caption-free stretches no mask at all.
   Clips with no detected text anywhere skip ProPainter entirely (`has_text` check in `process_clip`).
+- **Mask expansion is anisotropic and config-tunable without a rebuild.** Each detected polygon is
+  expanded around its own bbox center: width × `mask_scale_x` (default 1.45) + `mask_pad_x` px per side
+  (default 8), height × `mask_scale_y` (default 1.15). Horizontal is much larger on purpose — the DB text
+  detector expands its shrunken text core by `area×ratio/perimeter` ≈ a constant proportional to text
+  *height*, so detected boxes clip word sides by a similar amount regardless of word width. These three
+  values flow `config.yaml` → backend payload → job input (handler defaults `MASK_SCALE_X/Y`,
+  `MASK_PAD_X`) — tune in config.yaml + restart the backend; only OCR-constructor params like
+  `text_det_unclip_ratio` (2.0) require an image rebuild.
 - **PaddleOCR CPU fallback**: if Paddle GPU construction/inference throws (e.g. wheel lacks CUDA kernels
   for the GPU model RunPod scheduled), `_ocr_predict()` rebuilds the OCR singleton on CPU and continues —
   slower, but the job survives. `gpu_diagnostic()` logs the GPU model, compute capability, and a torch
