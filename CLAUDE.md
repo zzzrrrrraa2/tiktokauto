@@ -70,9 +70,20 @@ cold start) — the Dockerfile is the source of truth.
 
 ## GPU worker processing details
 
-- ProPainter runs on a **crop around the ROI** (`compute_crop_box`, ROI + 96 px margin, dims multiple of 8),
-  not the full frame — the inpainted crop is composited back. Keep `CROP_MARGIN` comfortably larger than
-  total mask dilation.
+- **The drawn ROI is honored vertically only.** `widen_roi()` expands the working ROI to the full frame
+  width (keeping the drawn vertical band ± 15%) before anything else runs. Users draw the box around a
+  *typical* word, but long words are 2-3× wider — and the OCR crop, mask arrays, and inpainting crop are
+  all hard-clipped to the working ROI, so through v12 every mask was silently capped at the drawn width
+  (~250 px on 1080 px videos), which surfaced as "removal width never changes". Don't reintroduce a
+  horizontal clip to the drawn box.
+- `WORKER_VERSION` is logged as the handler's first line and returned in the output — check it in RunPod
+  job logs to prove which image build served a job. Bump it together with the CI image tag in `build.yml`.
+- **`debug_masks`** (config.yaml → payload, default true) makes the worker also render and upload a debug
+  overlay video (green = raw OCR detections, red = final inpaint mask over the original frames); the
+  backend saves it to `data/final/<video_id>_debug.mp4`. Watch it before tuning any mask parameter.
+- ProPainter runs on a **crop around the (widened) ROI** (`compute_crop_box`, ROI + 96 px margin, dims
+  multiple of 8), not the full frame — the inpainted crop is composited back. Keep `CROP_MARGIN`
+  comfortably larger than total mask dilation.
 - Clips are split **re-encoded** (`libx264`, CFR) rather than stream-copied, so cuts are frame-accurate and
   the concat demuxer is safe. Audio is dropped at split time and muxed back from the original in the final
   step (`mux_audio`).

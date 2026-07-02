@@ -23,6 +23,8 @@ processing:
   mask_scale_x: 1.45  # horizontal expansion of each detected word box (1.0 = detected box)
   mask_scale_y: 1.15  # vertical expansion (pop animation overshoots to ~110%)
   mask_pad_x: 8       # extra constant pixels each side, catches clipped edge glyphs
+  debug_masks: true   # also produce data/final/<video>_debug.mp4 (green = raw OCR
+                      # detections, red = final inpaint mask) — turn off once tuned
   output_fps: null  # null = keep original FPS
   output_codec: "libx264"
   output_preset: "medium"

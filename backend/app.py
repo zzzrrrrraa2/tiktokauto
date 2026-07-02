@@ -164,6 +164,7 @@ def process_video_pipeline(video_id: str):
             "mask_scale_x": config["processing"].get("mask_scale_x", 1.45),
             "mask_scale_y": config["processing"].get("mask_scale_y", 1.15),
             "mask_pad_x": config["processing"].get("mask_pad_x", 8),
+            "debug_masks": config["processing"].get("debug_masks", True),
             "scene_threshold": config["scene_detection"]["threshold"],
             "min_scene_length": config["scene_detection"]["min_scene_length"],
             "max_clip_duration": config["processing"]["clip_max_duration"]
@@ -189,6 +190,16 @@ def process_video_pipeline(video_id: str):
             log(f"Downloading result from Drive (file id {result_file_id})")
             download_from_drive(result_file_id, final_path, creds)
             delete_from_drive(result_file_id, creds)
+
+            debug_file_id = (result or {}).get("debug_file_id", "")
+            if debug_file_id:
+                try:
+                    debug_path = str(final_dir / f"{video_id}_debug.mp4")
+                    download_from_drive(debug_file_id, debug_path, creds)
+                    delete_from_drive(debug_file_id, creds)
+                    log(f"Debug overlay saved to {debug_path}")
+                except Exception as e:
+                    log(f"Debug overlay download failed (non-fatal): {e}")
 
             log(f"Pipeline complete — result saved to {final_path}")
             queue.set_video_result(video_id, final_path)

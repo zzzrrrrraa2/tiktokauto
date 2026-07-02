@@ -77,6 +77,10 @@ from core.utils import to_tensors
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_HALF = DEVICE.type == "cuda"
 
+# Logged at job start and returned in the output so it's always provable which
+# image build actually served a job. Bump together with the CI image tag.
+WORKER_VERSION = "v13"
+
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 
@@ -293,6 +297,32 @@ def write_video(frames, fps: float, output_path: str):
     )
 
 
+def write_debug_video(frames, masks, raw_masks, roi: dict, fps: float, output_path: str):
+    """Overlay the final inpaint mask (red, 40% alpha) and the raw OCR
+    detections (green outlines) on the original frames. Frame-by-frame so the
+    clip isn't duplicated in memory; must run BEFORE compositing mutates
+    `frames` in place."""
+    import imageio
+    x, y = roi["x"], roi["y"]
+    writer = imageio.get_writer(
+        output_path, fps=fps,
+        codec="libx264", quality=8,
+        pixelformat="yuv420p", macro_block_size=2,
+    )
+    try:
+        for i in range(len(frames)):
+            img = frames[i].copy()
+            hot = masks[i] > 0
+            img[hot] = (img[hot] * 0.6 + np.array([255, 0, 0]) * 0.4).astype(np.uint8)
+            if raw_masks is not None and raw_masks[i].any():
+                contours, _ = cv2.findContours(raw_masks[i], cv2.RETR_EXTERNAL,
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(img, contours, -1, (0, 255, 0), 2, offset=(x, y))
+            writer.append_data(img)
+    finally:
+        writer.close()
+
+
 # ---------------------------------------------------------------------------
 # OCR → text masks
 # ---------------------------------------------------------------------------
@@ -345,8 +375,23 @@ def clamp_roi(roi: dict, width: int, height: int) -> dict:
     return {"x": x, "y": y, "w": w, "h": h}
 
 
+def widen_roi(roi: dict, width: int, height: int) -> dict:
+    """Working ROI from the user-drawn box: honor only its vertical band.
+
+    Word width routinely exceeds the drawn box (users draw it around a typical
+    word; long words are 2-3x wider), and everything downstream — the OCR crop,
+    the mask arrays, the inpainting crop — is hard-clipped to the working ROI.
+    Through v12 that silently capped every mask at the drawn width. So: full
+    frame width horizontally, drawn band plus a 15% margin vertically."""
+    margin = int(round(roi["h"] * 0.15))
+    y = max(0, int(roi["y"]) - margin)
+    h = min(height - y, int(roi["h"]) + 2 * margin)
+    return {"x": 0, "y": y, "w": width, "h": h}
+
+
 def run_ocr(frames, roi: dict, scale_x: float = MASK_SCALE_X,
-            scale_y: float = MASK_SCALE_Y, pad_x: float = MASK_PAD_X) -> list:
+            scale_y: float = MASK_SCALE_Y, pad_x: float = MASK_PAD_X,
+            return_debug: bool = False):
     """Per-word max-extent masking. Returns one full-frame uint8 mask (0/255)
     per frame.
 
@@ -362,11 +407,15 @@ def run_ocr(frames, roi: dict, scale_x: float = MASK_SCALE_X,
     of its life (including pop-in/pop-out frames where OCR sees nothing or a
     tiny box) is masked at the word's biggest extent, while short words get
     proportionally small holes and caption-free stretches get no mask at all.
+
+    With return_debug=True, also returns the raw (unexpanded, unwindowed)
+    per-frame detection mini-masks (n, roi_h, roi_w) for the debug overlay.
     """
     try:
         import paddleocr  # noqa: F401 — availability check only
     except ImportError:
-        return _fallback_text_detection(frames, roi)
+        masks = _fallback_text_detection(frames, roi)
+        return (masks, None) if return_debug else masks
 
     x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
     frame_h, frame_w = frames[0].shape[:2]
@@ -374,6 +423,7 @@ def run_ocr(frames, roi: dict, scale_x: float = MASK_SCALE_X,
 
     # Pass 1: OCR each frame's ROI crop into an ROI-sized mini-mask.
     roi_masks = np.zeros((n, h, w), dtype=np.uint8)
+    raw_masks = np.zeros((n, h, w), dtype=np.uint8) if return_debug else None
     for i in range(0, n, OCR_STEP):
         roi_bgr = cv2.cvtColor(frames[i][y:y+h, x:x+w], cv2.COLOR_RGB2BGR)
         result = _ocr_predict(roi_bgr)
@@ -383,6 +433,8 @@ def run_ocr(frames, roi: dict, scale_x: float = MASK_SCALE_X,
                 continue
             for box in polys:
                 pts = np.asarray(box, dtype=np.float32).reshape(-1, 2)
+                if raw_masks is not None:
+                    cv2.fillPoly(raw_masks[i], [np.round(pts).astype(np.int32)], 255)
                 cx, cy = (pts.min(axis=0) + pts.max(axis=0)) / 2.0
                 pts[:, 0] = cx + (pts[:, 0] - cx) * scale_x + np.sign(pts[:, 0] - cx) * pad_x
                 pts[:, 1] = cy + (pts[:, 1] - cy) * scale_y
@@ -396,7 +448,7 @@ def run_ocr(frames, roi: dict, scale_x: float = MASK_SCALE_X,
         mask[y:y+h, x:x+w] = roi_masks[lo:hi].max(axis=0)
         mask_frames.append(mask)
 
-    return mask_frames
+    return (mask_frames, raw_masks) if return_debug else mask_frames
 
 
 def _fallback_text_detection(frames, roi: dict) -> list:
@@ -632,19 +684,31 @@ def process_clip(clip_path: str, roi: dict, clip_id: str, mask_dilation: int,
                  work_dir: str, log,
                  mask_scale_x: float = MASK_SCALE_X,
                  mask_scale_y: float = MASK_SCALE_Y,
-                 mask_pad_x: float = MASK_PAD_X) -> str:
-    """Full processing of a single clip: OCR → mask → crop → ProPainter → composite."""
+                 mask_pad_x: float = MASK_PAD_X,
+                 debug: bool = False):
+    """Full processing of a single clip: OCR → mask → crop → ProPainter → composite.
+    Returns (result_path, debug_path-or-None)."""
     frames, fps = load_video_frames(clip_path)
     n, frame_h, frame_w = frames.shape[0], frames.shape[1], frames.shape[2]
 
     roi_c = clamp_roi(roi, frame_w, frame_h)
-    masks = run_ocr(frames, roi_c, mask_scale_x, mask_scale_y, mask_pad_x)
+    raw_masks = None
+    if debug:
+        masks, raw_masks = run_ocr(frames, roi_c, mask_scale_x, mask_scale_y,
+                                   mask_pad_x, return_debug=True)
+    else:
+        masks = run_ocr(frames, roi_c, mask_scale_x, mask_scale_y, mask_pad_x)
 
     pre_dilate = max(1, mask_dilation // 2)
     kernel = np.ones((3, 3), np.uint8)
     masks = [cv2.dilate(m, kernel, iterations=pre_dilate) if m.any() else m for m in masks]
 
     result_path = os.path.join(work_dir, f"{clip_id}_out.mp4")
+
+    debug_path = None
+    if debug:
+        debug_path = os.path.join(work_dir, f"{clip_id}_debug.mp4")
+        write_debug_video(frames, masks, raw_masks, roi_c, fps, debug_path)
 
     has_text = any(m.any() for m in masks)
     if has_text and n >= 2:
@@ -665,7 +729,7 @@ def process_clip(clip_path: str, roi: dict, clip_id: str, mask_dilation: int,
         log(f"{clip_id}: {n} frames, no text detected — passing through")
 
     write_video(frames, fps, result_path)
-    return result_path
+    return result_path, debug_path
 
 
 fix_raft = None
@@ -711,7 +775,7 @@ def handler(job):
     video_id = job_input.get("video_id", "unknown")
     log = lambda msg: print(f"[GPU_WORKER] [{video_id}] {msg}", flush=True)
 
-    log(f"Handler invoked — input keys: {list(job_input.keys())}")
+    log(f"Worker {WORKER_VERSION} — handler invoked, input keys: {list(job_input.keys())}")
 
     roi = job_input["roi"]
     mask_dilation = int(job_input.get("mask_dilation", 8))
@@ -721,11 +785,12 @@ def handler(job):
     mask_scale_x = float(job_input.get("mask_scale_x", MASK_SCALE_X))
     mask_scale_y = float(job_input.get("mask_scale_y", MASK_SCALE_Y))
     mask_pad_x = float(job_input.get("mask_pad_x", MASK_PAD_X))
+    debug_masks = bool(job_input.get("debug_masks", True))
     drive_token = job_input.get("drive_access_token", "")
     log(f"Params — roi={roi} mask_dilation={mask_dilation} scene_threshold={scene_threshold} "
         f"min_scene_length={min_scene_length} max_clip_duration={max_clip_duration} "
         f"mask_scale_x={mask_scale_x} mask_scale_y={mask_scale_y} mask_pad_x={mask_pad_x} "
-        f"drive_token={'yes' if drive_token else 'no'}")
+        f"debug_masks={debug_masks} drive_token={'yes' if drive_token else 'no'}")
 
     # --- Acquire the source video ---------------------------------------
     video_file_id = job_input.get("video_file_id", "")
@@ -775,6 +840,11 @@ def handler(job):
         info = probe_video(video_path)
         fps = info["fps"]
 
+        roi_user = roi
+        roi = widen_roi(roi, info["width"], info["height"])
+        log(f"ROI widened {roi_user} -> {roi} (drawn box marks the caption band; "
+            f"word width routinely exceeds it)")
+
         # Step 1: scene detection
         log("Step 1: Scene detection...")
         cuts = detect_scenes(video_path, threshold=scene_threshold,
@@ -791,19 +861,22 @@ def handler(job):
 
         # Step 3: process each clip
         result_clips = []
+        debug_clips = []
         for i, clip_path in enumerate(clip_paths):
             clip_id = f"clip_{i+1:04d}"
             log(f"Step 3.{i+1}/{len(clip_paths)}: Processing {clip_id}...")
             t_clip = time.time()
-            result_path = process_clip(
+            result_path, debug_path = process_clip(
                 clip_path, roi, clip_id, mask_dilation,
                 fix_raft, fix_flow_complete, propainter_model,
                 work_dir, log,
                 mask_scale_x=mask_scale_x, mask_scale_y=mask_scale_y,
-                mask_pad_x=mask_pad_x
+                mask_pad_x=mask_pad_x, debug=debug_masks
             )
             log(f"{clip_id} done in {time.time() - t_clip:.1f}s")
             result_clips.append(result_path)
+            if debug_path:
+                debug_clips.append(debug_path)
 
         # Step 4: concatenate + restore audio
         log("Step 4: Concatenating clips and muxing audio...")
@@ -819,6 +892,7 @@ def handler(job):
         # Step 5: deliver the result
         output = {
             "video_id": video_id,
+            "worker_version": WORKER_VERSION,
             "num_clips": len(clip_paths),
             "total_time": round(t_total, 1),
             "status": "completed",
@@ -829,6 +903,15 @@ def handler(job):
             output["result_file_id"] = drive_upload(final_path, result_name, drive_token)
             output["result_name"] = result_name
             log(f"Uploaded result — file id {output['result_file_id']}")
+            if debug_clips:
+                try:
+                    debug_video_path = os.path.join(work_dir, "debug.mp4")
+                    concat_clips(debug_clips, debug_video_path)
+                    output["debug_file_id"] = drive_upload(
+                        debug_video_path, f"{video_id}_debug.mp4", drive_token)
+                    log(f"Uploaded debug overlay — file id {output['debug_file_id']}")
+                except Exception as e:
+                    log(f"Debug overlay upload failed (non-fatal): {e}")
         elif final_size <= 15 * 1024 * 1024:
             log("Step 5: No Drive token — returning result inline (base64)")
             with open(final_path, "rb") as f:
