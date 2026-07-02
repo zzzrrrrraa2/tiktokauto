@@ -10,6 +10,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -28,6 +34,6 @@ jobs:
           context: ./gpu_worker
           file: ./gpu_worker/Dockerfile
           push: true
-          tags: shokiii/caption-removal-worker:v8
+          tags: shokiii/caption-removal-worker:v9
           cache-from: type=gha
           cache-to: type=gha,mode=max
