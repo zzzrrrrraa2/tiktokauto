@@ -76,14 +76,14 @@ cold start) — the Dockerfile is the source of truth.
 - Clips are split **re-encoded** (`libx264`, CFR) rather than stream-copied, so cuts are frame-accurate and
   the concat demuxer is safe. Audio is dropped at split time and muxed back from the original in the final
   step (`mux_audio`).
-- **OCR → mask is a per-clip union, not per-frame.** `run_ocr()` samples every `OCR_STEP` (2) frames on a
-  BGR ROI crop via `ocr.predict()` (PaddleOCR 3.x API — no `cls`/`use_angle_cls`/`use_gpu` params, results
-  read from `res["dt_polys"]`), unions every detected polygon into a single mask, scales that union by
-  `OVERSHOOT_SCALE` (1.15×) around its bounding-box center to cover pop-in/out overshoot, and returns that
-  *same* mask for every frame in the clip. This is deliberate: captions here are fast, animated, one-word
-  pop-ins (~6-12 frames @ 30fps) that sparser/per-frame masking would miss or lag behind, and a temporally
-  constant mask is what ProPainter wants for a stable fill. Trade-off: caption-free frames in a clip also
-  get their caption band inpainted — acceptable since that band is overlaid with new captions downstream.
+- **OCR → mask is per-word max-extent via a sliding temporal window.** `run_ocr()` OCRs **every** frame's
+  BGR ROI crop (`OCR_STEP = 1`) via `ocr.predict()` (PaddleOCR 3.x API — no `cls`/`use_angle_cls`/`use_gpu`
+  params, results read from `res["dt_polys"]`). Each detected polygon is scaled by `OVERSHOOT_SCALE`
+  (1.15×) around its **own** bbox center (captions pop in ~0%→110%→100%), and a frame's mask is the union
+  of detections within `MASK_WINDOW` (±5) frames. Rationale: captions are one-word pop-ins living ~6-12
+  frames @ 30fps, so every frame of a word's life — including pop-in/out frames OCR can't see — is within
+  the window of its peak-size detection and gets masked at the word's biggest extent, while short words
+  ("at") get small holes, long words ("readiness") wide ones, and caption-free stretches no mask at all.
   Clips with no detected text anywhere skip ProPainter entirely (`has_text` check in `process_clip`).
 - **PaddleOCR CPU fallback**: if Paddle GPU construction/inference throws (e.g. wheel lacks CUDA kernels
   for the GPU model RunPod scheduled), `_ocr_predict()` rebuilds the OCR singleton on CPU and continues —

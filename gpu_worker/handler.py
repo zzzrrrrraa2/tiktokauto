@@ -86,9 +86,11 @@ CROP_MARGIN = 96
 CROP_MIN_SIZE = 160
 
 # Captions here are fast, animated, one-word pop-ins (~6-12 frames @ 30fps).
-# Sample densely and take the union of every detection across the clip, then
-# apply that single mask to every frame — see run_ocr() for rationale.
-OCR_STEP = 2
+# OCR every frame; each frame's mask is the union of detections within
+# MASK_WINDOW frames on either side, so every word is masked at its biggest
+# extent for its whole lifetime — see run_ocr() for rationale.
+OCR_STEP = 1
+MASK_WINDOW = 5
 OVERSHOOT_SCALE = 1.15
 
 
@@ -335,17 +337,19 @@ def clamp_roi(roi: dict, width: int, height: int) -> dict:
 
 
 def run_ocr(frames, roi: dict) -> list:
-    """Detect caption text across the clip and return ONE union mask, applied to
-    every frame.
+    """Per-word max-extent masking. Returns one full-frame uint8 mask (0/255)
+    per frame.
 
-    Captions here are fast, animated, one-word pop-ins (~6-12 frames @ 30fps) —
-    a word can appear and vanish between sparse OCR samples, or be caught mid-
-    animation when it's smaller than its peak size. Sampling every OCR_STEP frames
-    and unioning every detected polygon (scaled up by OVERSHOOT_SCALE to cover the
-    pop-in/out overshoot) guarantees every word is covered at its biggest extent,
-    and using the same mask on every frame keeps the ProPainter hole temporally
-    stable. The caption band gets inpainted even on the rare word-free frame —
-    acceptable since it's overlaid with new (translated) captions downstream.
+    Captions here are fast, animated, one-word pop-ins (~6-12 frames @ 30fps,
+    scaling ~0%→110%→100%), and word sizes vary hugely ("readiness" vs "at").
+    OCR runs on every frame's ROI crop; each detected polygon is scaled by
+    OVERSHOOT_SCALE around its own bbox center (matching the pop animation's
+    overshoot). A frame's mask is then the union of detections within
+    MASK_WINDOW frames on either side — a word is only ever MASK_WINDOW frames
+    from its peak-size detection, so every frame of its life (including pop-in/
+    pop-out frames where OCR sees nothing or a tiny box) is masked at the
+    word's biggest extent, while short words get proportionally small holes and
+    caption-free stretches get no mask at all.
     """
     try:
         import paddleocr  # noqa: F401 — availability check only
@@ -354,9 +358,11 @@ def run_ocr(frames, roi: dict) -> list:
 
     x, y, w, h = roi["x"], roi["y"], roi["w"], roi["h"]
     frame_h, frame_w = frames[0].shape[:2]
-    union = np.zeros((frame_h, frame_w), dtype=np.uint8)
+    n = len(frames)
 
-    for i in range(0, len(frames), OCR_STEP):
+    # Pass 1: OCR each frame's ROI crop into an ROI-sized mini-mask.
+    roi_masks = np.zeros((n, h, w), dtype=np.uint8)
+    for i in range(0, n, OCR_STEP):
         roi_bgr = cv2.cvtColor(frames[i][y:y+h, x:x+w], cv2.COLOR_RGB2BGR)
         result = _ocr_predict(roi_bgr)
         for res in result or []:
@@ -364,19 +370,20 @@ def run_ocr(frames, roi: dict) -> list:
             if polys is None:
                 continue
             for box in polys:
-                box = np.asarray(box, dtype=np.int32).reshape(-1, 2)
-                box[:, 0] += x
-                box[:, 1] += y
-                cv2.fillPoly(union, [box], 255)
+                pts = np.asarray(box, dtype=np.float32).reshape(-1, 2)
+                center = (pts.min(axis=0) + pts.max(axis=0)) / 2.0
+                pts = center + (pts - center) * OVERSHOOT_SCALE
+                cv2.fillPoly(roi_masks[i], [np.round(pts).astype(np.int32)], 255)
 
-    if union.any():
-        ys, xs = np.nonzero(union)
-        cx, cy = (xs.min() + xs.max()) / 2.0, (ys.min() + ys.max()) / 2.0
-        scale_mat = cv2.getRotationMatrix2D((cx, cy), 0, OVERSHOOT_SCALE)
-        scaled = cv2.warpAffine(union, scale_mat, (frame_w, frame_h), flags=cv2.INTER_NEAREST)
-        union = cv2.bitwise_or(union, scaled)
+    # Pass 2: per-frame union over the temporal window, embedded full-frame.
+    mask_frames = []
+    for i in range(n):
+        lo, hi = max(0, i - MASK_WINDOW), min(n, i + MASK_WINDOW + 1)
+        mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
+        mask[y:y+h, x:x+w] = roi_masks[lo:hi].max(axis=0)
+        mask_frames.append(mask)
 
-    return [union.copy() for _ in range(len(frames))]
+    return mask_frames
 
 
 def _fallback_text_detection(frames, roi: dict) -> list:
