@@ -23,7 +23,9 @@ from flask_cors import CORS
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pipeline.ffmpeg_utils import probe_video, extract_frame, split_video, concat_clips, mux_audio
+from pipeline.ffmpeg_utils import (probe_video, extract_frame, split_video, concat_clips,
+                                   mux_audio, extract_audio, pair_swap_order)
+from pipeline.dubbing import dub_audio
 from pipeline.scene_detect import detect_scenes, subdivide_segments
 from pipeline.runpod_client import RunPodClient
 from pipeline.job_queue import JobQueue
@@ -192,6 +194,27 @@ def _process_parallel_clips(video_id: str, video: dict, roi: dict, log):
     shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    # Kick off dubbing immediately — it runs at ElevenLabs while the clips go
+    # through split/upload/RunPod, and is joined right before the final mux.
+    dub_future = None
+    dub_executor = None
+    if config["processing"].get("dub_enabled", False):
+        eleven_key = os.environ.get("ELEVENLABS_API_KEY", "")
+        if not eleven_key:
+            log("WARNING: dub_enabled but ELEVENLABS_API_KEY not set — skipping dubbing")
+        else:
+            audio_src = extract_audio(video_path, str(work_dir / "orig_audio.mp3"))
+            if not audio_src:
+                log("WARNING: video has no audio stream — skipping dubbing")
+            else:
+                target_lang = config["processing"].get("dub_target_lang", "de")
+                log(f"Starting ElevenLabs dubbing to '{target_lang}' in background...")
+                dub_executor = ThreadPoolExecutor(max_workers=1)
+                dub_future = dub_executor.submit(
+                    dub_audio, audio_src, target_lang, eleven_key,
+                    str(work_dir / f"dubbed_{target_lang}.mp3"),
+                    timeout=config["processing"].get("dub_timeout", 900))
+
     log("Detecting scenes locally...")
     cuts = detect_scenes(video_path,
                          threshold=config["scene_detection"]["threshold"],
@@ -276,13 +299,29 @@ def _process_parallel_clips(video_id: str, video: dict, roi: dict, log):
 
     log("All clips done — concatenating and muxing audio...")
     results.sort(key=lambda t: t[0])
+    if config["processing"].get("shuffle_clips", True):
+        order = pair_swap_order(len(results))
+        results = [results[j] for j in order]
+        log(f"Shuffled clip order (video only, audio unchanged): {[j + 1 for j in order]}")
     final_dir = DATA_DIR / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
 
     video_only = str(work_dir / "video_only.mp4")
     concat_clips([r[1] for r in results], video_only)
+
+    audio_source = video_path  # fallback: original audio
+    if dub_future is not None:
+        try:
+            audio_source = dub_future.result()
+            log("Dubbing done — using dubbed audio track")
+        except Exception as e:
+            log(f"WARNING: dubbing failed, falling back to original audio: {e}")
+            queue._log(video_id, None, "dubbing_warning", str(e))
+    if dub_executor is not None:
+        dub_executor.shutdown(wait=False)
+
     final_path = str(final_dir / f"{video_id}_final.mp4")
-    mux_audio(video_only, video_path, final_path)
+    mux_audio(video_only, audio_source, final_path)
 
     debug_paths = [r[2] for r in results if r[2]]
     if debug_paths:

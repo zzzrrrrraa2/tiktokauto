@@ -135,6 +135,46 @@ def concat_clips(clip_paths: list[str], output_path: str):
     os.remove(concat_file)
 
 
+def extract_audio(video_path: str, output_path: str) -> Optional[str]:
+    """Extract the audio track as mp3 (small upload for the dubbing API).
+    Returns output_path, or None if the source has no audio stream."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams",
+         "-select_streams", "a", video_path],
+        capture_output=True, text=True)
+    if probe.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {probe.stderr}")
+    if not json.loads(probe.stdout).get("streams"):
+        return None
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vn",
+        "-c:a", "libmp3lame", "-b:a", "192k",
+        output_path
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg audio extract failed: "
+                           f"{proc.stderr.decode(errors='replace')[-2000:]}")
+    return output_path
+
+
+def pair_swap_order(n: int) -> list[int]:
+    """0-based output order that keeps clip 0 first and swaps each subsequent
+    pair: n=6 -> [0, 2, 1, 4, 3, 5]; n=7 -> [0, 2, 1, 4, 3, 6, 5]. An odd
+    tail clip stays in place; n <= 2 is identity."""
+    order = [0] if n > 0 else []
+    i = 1
+    while i + 1 < n:
+        order += [i + 1, i]
+        i += 2
+    if i < n:
+        order.append(i)
+    return order
+
+
 def mux_audio(video_path: str, audio_source_path: str, output_path: str):
     """Copy the processed video stream and add the original audio (if any).
     Ported from gpu_worker/handler.py — the '?' makes the audio map optional so
