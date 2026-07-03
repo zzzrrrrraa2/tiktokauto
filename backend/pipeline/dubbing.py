@@ -32,7 +32,9 @@ def dub_audio(audio_path: str, target_lang: str, api_key: str,
                 "target_lang": target_lang,
                 "source_lang": "auto",
                 "num_speakers": "0",
-                "watermark": "false",
+                # watermark=false needs Starter+; input is audio-only so the
+                # (video-only) watermark never appears in our output anyway
+                "watermark": "true",
             },
             timeout=300,
         )

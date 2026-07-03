@@ -34,6 +34,13 @@ processing:
                        # ELEVENLABS_API_KEY in .env); falls back to original audio on failure
   dub_target_lang: "de"  # ISO language code (de, es, fr, ...)
   dub_timeout: 900     # seconds to wait for the ElevenLabs dub job
+  transition_blur: true          # blur clip edges at every concat boundary to soften
+                                 # the hard cuts the shuffle creates
+  transition_blur_duration: 0.15 # seconds blurred on each side of a cut (~4-5 frames @30fps)
+  captions_enabled: true         # burn one-word TikTok-style captions from the (dubbed) audio
+  caption_font: "Arial Black"
+  caption_font_size: 0           # 0 = auto (~4.2% of video height, ~80px @1080x1920)
+  caption_whisper_model: "small" # faster-whisper model; first run downloads ~460MB
   output_fps: null  # null = keep original FPS
   output_codec: "libx264"
   output_preset: "medium"

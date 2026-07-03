@@ -24,8 +24,10 @@ from flask_cors import CORS
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline.ffmpeg_utils import (probe_video, extract_frame, split_video, concat_clips,
-                                   mux_audio, extract_audio, pair_swap_order)
+                                   mux_audio, extract_audio, pair_swap_order,
+                                   blur_clip_edges)
 from pipeline.dubbing import dub_audio
+from pipeline.captions import transcribe_words, build_ass
 from pipeline.scene_detect import detect_scenes, subdivide_segments
 from pipeline.runpod_client import RunPodClient
 from pipeline.job_queue import JobQueue
@@ -306,8 +308,22 @@ def _process_parallel_clips(video_id: str, video: dict, roi: dict, log):
     final_dir = DATA_DIR / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
 
+    concat_sources = [r[1] for r in results]
+    if config["processing"].get("transition_blur", True) and len(results) > 1:
+        blur_dur = config["processing"].get("transition_blur_duration", 0.15)
+        log(f"Blurring clip edges ({blur_dur}s per side) for smooth transitions...")
+
+        def _blur(k):
+            out = str(work_dir / f"blur_{k:04d}.mp4")
+            blur_clip_edges(concat_sources[k], out, fps, blur_duration=blur_dur,
+                            blur_start=(k > 0), blur_end=(k < len(concat_sources) - 1))
+            return out
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            concat_sources = list(pool.map(_blur, range(len(concat_sources))))
+
     video_only = str(work_dir / "video_only.mp4")
-    concat_clips([r[1] for r in results], video_only)
+    concat_clips(concat_sources, video_only)
 
     audio_source = video_path  # fallback: original audio
     if dub_future is not None:
@@ -320,8 +336,31 @@ def _process_parallel_clips(video_id: str, video: dict, roi: dict, log):
     if dub_executor is not None:
         dub_executor.shutdown(wait=False)
 
+    subtitles_path = None
+    if config["processing"].get("captions_enabled", True):
+        try:
+            # dubbed audio -> known language; original-audio fallback -> auto-detect
+            lang = (config["processing"].get("dub_target_lang", "de")
+                    if audio_source != video_path else None)
+            log("Transcribing audio for captions (faster-whisper, CPU)...")
+            words = transcribe_words(
+                audio_source,
+                model_size=config["processing"].get("caption_whisper_model", "small"),
+                language=lang)
+            font_size = (config["processing"].get("caption_font_size", 0)
+                         or max(36, round(video["height"] * 0.042)))
+            subtitles_path = build_ass(
+                words, video["width"], video["height"], roi,
+                config["processing"].get("caption_font", "Arial Black"),
+                font_size, str(work_dir / "captions.ass"))
+            log(f"Captions ready: {len(words)} words")
+        except Exception as e:
+            log(f"WARNING: captioning failed, muxing without captions: {e}")
+            queue._log(video_id, None, "caption_warning", str(e))
+            subtitles_path = None
+
     final_path = str(final_dir / f"{video_id}_final.mp4")
-    mux_audio(video_only, audio_source, final_path)
+    mux_audio(video_only, audio_source, final_path, subtitles_path=subtitles_path)
 
     debug_paths = [r[2] for r in results if r[2]]
     if debug_paths:

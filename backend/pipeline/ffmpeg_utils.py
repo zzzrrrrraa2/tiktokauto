@@ -175,20 +175,67 @@ def pair_swap_order(n: int) -> list[int]:
     return order
 
 
-def mux_audio(video_path: str, audio_source_path: str, output_path: str):
-    """Copy the processed video stream and add the original audio (if any).
-    Ported from gpu_worker/handler.py — the '?' makes the audio map optional so
-    audio-less sources still mux cleanly."""
+def blur_clip_edges(clip_path: str, output_path: str, fps: float,
+                    blur_duration: float = 0.15,
+                    blur_start: bool = True, blur_end: bool = True,
+                    strength: int = 10):
+    """Re-encode a clip with a short blur on its first/last blur_duration
+    seconds, smoothing the hard cuts created by clip shuffling. Duration is
+    unchanged, so audio timing is unaffected."""
+    conds = []
+    if blur_start:
+        conds.append(f"lt(t,{blur_duration:.3f})")
+    if blur_end:
+        dur = probe_video(clip_path)["duration"]
+        conds.append(f"gt(t,{dur - blur_duration:.3f})")
+    if not conds:
+        raise ValueError("blur_start and blur_end are both False")
+    vf = (f"boxblur=luma_radius={strength}:luma_power=2:"
+          f"chroma_radius={strength // 2}:"
+          f"enable='{'+'.join(conds)}'")
     cmd = [
         "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", audio_source_path,
-        "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        "-shortest", "-movflags", "+faststart",
+        "-i", clip_path,
+        "-vf", vf,
+        "-an",
+        "-vsync", "cfr", "-r", f"{fps}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p",
         output_path
     ]
     proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg edge blur failed: "
+                           f"{proc.stderr.decode(errors='replace')[-2000:]}")
+
+
+def mux_audio(video_path: str, audio_source_path: str, output_path: str,
+              subtitles_path: Optional[str] = None):
+    """Copy the processed video stream and add the original audio (if any).
+    Ported from gpu_worker/handler.py — the '?' makes the audio map optional so
+    audio-less sources still mux cleanly. With subtitles_path set, burns the
+    ASS captions in (requires a re-encode instead of the stream copy); the
+    subprocess runs with cwd = the .ass file's dir so the libass filter arg
+    needs no Windows drive-colon escaping."""
+    if subtitles_path:
+        cwd = os.path.dirname(os.path.abspath(subtitles_path))
+        video_args = ["-vf", f"ass={os.path.basename(subtitles_path)}",
+                      "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                      "-pix_fmt", "yuv420p"]
+    else:
+        cwd = None
+        video_args = ["-c:v", "copy"]
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", os.path.abspath(video_path),
+        "-i", os.path.abspath(audio_source_path),
+        "-map", "0:v:0", "-map", "1:a:0?",
+        *video_args,
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart",
+        os.path.abspath(output_path)
+    ]
+    proc = subprocess.run(cmd, capture_output=True, cwd=cwd)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg audio mux failed: "
                            f"{proc.stderr.decode(errors='replace')[-2000:]}")
