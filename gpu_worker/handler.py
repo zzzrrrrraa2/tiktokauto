@@ -32,6 +32,8 @@ import base64
 import shutil
 import fractions
 import subprocess
+import hashlib
+import re
 import numpy as np
 import cv2
 from PIL import Image
@@ -79,7 +81,8 @@ USE_HALF = DEVICE.type == "cuda"
 
 # Logged at job start and returned in the output so it's always provable which
 # image build actually served a job. Bump together with the CI image tag.
-WORKER_VERSION = "v13"
+WORKER_VERSION = "v14"
+PAYLOAD_SCHEMA_VERSION = 1
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
@@ -111,15 +114,150 @@ MASK_PAD_X = 8
 # Google Drive transfer (plain REST — no client libraries needed on the worker)
 # ---------------------------------------------------------------------------
 
-def drive_download(file_id: str, token: str, dest_path: str):
+def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while True:
+            chunk = source.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def structured_error(code: str, retryable: bool, stage: str, message: str,
+                     job_id: str = None, signature: str = None) -> dict:
+    return {
+        "code": code,
+        "retryable": bool(retryable),
+        "stage": stage,
+        "message": str(message)[:2000],
+        "worker_version": WORKER_VERSION,
+        "job_id": job_id,
+        "signature": signature or hashlib.sha256(
+            f"{stage}:{code}:{message}".encode()).hexdigest()[:20],
+    }
+
+
+def drive_file_metadata(file_id: str, token: str):
     import requests as req
+    response = req.get(
+        f"{DRIVE_API}/files/{file_id}",
+        params={"fields": "id,name,size,md5Checksum,appProperties,trashed"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json()
+
+
+def drive_download(file_id: str, token: str, dest_path: str,
+                   expected_size: int = None, expected_sha256: str = None):
+    import requests as req
+    partial = f"{dest_path}.partial"
+    offset = os.path.getsize(partial) if os.path.isfile(partial) else 0
+    headers = {"Authorization": f"Bearer {token}"}
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
     with req.get(f"{DRIVE_API}/files/{file_id}?alt=media",
-                 headers={"Authorization": f"Bearer {token}"},
-                 stream=True, timeout=600) as r:
+                 headers=headers, stream=True, timeout=600) as r:
         r.raise_for_status()
-        with open(dest_path, "wb") as f:
+        mode = "ab" if offset and r.status_code == 206 else "wb"
+        with open(partial, mode) as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
+                if chunk:
+                    f.write(chunk)
+    size = os.path.getsize(partial)
+    if expected_size is not None and size != int(expected_size):
+        raise ValueError(
+            f"input size mismatch: expected {expected_size}, received {size}")
+    digest = sha256_file(partial)
+    if expected_sha256 and digest.lower() != expected_sha256.lower():
+        raise ValueError("input SHA-256 mismatch")
+    os.replace(partial, dest_path)
+    return {"size": size, "sha256": digest}
+
+
+def _session_offset(response) -> int:
+    match = re.search(r"bytes=0-(\d+)", response.headers.get("Range", ""))
+    return int(match.group(1)) + 1 if match else 0
+
+
+def drive_upload_reserved(file_path: str, file_id: str, session_url: str,
+                          token: str, name: str = None) -> dict:
+    """Resume the backend-created session for a pre-generated Drive file ID."""
+    import requests as req
+    size = os.path.getsize(file_path)
+    digest = sha256_file(file_path)
+    if not session_url:
+        response = req.post(
+            f"{DRIVE_UPLOAD}?uploadType=resumable&fields=id,size,md5Checksum",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": "video/mp4",
+                "X-Upload-Content-Length": str(size),
+            },
+            json={"id": file_id, "name": name or f"{file_id}.mp4"},
+            timeout=60,
+        )
+        if response.status_code == 409:
+            existing = drive_file_metadata(file_id, token)
+            if existing and int(existing.get("size") or 0) > 0:
+                return {"id": file_id, "size": int(existing["size"]),
+                        "sha256": None, "already_existed": True}
+        response.raise_for_status()
+        session_url = response.headers["Location"]
+
+    query = req.put(
+        session_url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Length": "0",
+            "Content-Range": f"bytes */{size}",
+        },
+        timeout=60,
+    )
+    if query.status_code in (200, 201):
+        return {"id": file_id, "size": size, "sha256": digest}
+    if query.status_code == 308:
+        offset = _session_offset(query)
+    elif query.status_code in (404, 410):
+        # Recreate using the same deterministic ID. A 409 is checked as
+        # possible prior success, so this cannot create a duplicate.
+        return drive_upload_reserved(file_path, file_id, "", token, name)
+    else:
+        query.raise_for_status()
+
+    chunk_size = 8 * 1024 * 1024
+    with open(file_path, "rb") as source:
+        source.seek(offset)
+        while offset < size:
+            data = source.read(min(chunk_size, size - offset))
+            end = offset + len(data) - 1
+            response = req.put(
+                session_url,
+                data=data,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "video/mp4",
+                    "Content-Length": str(len(data)),
+                    "Content-Range": f"bytes {offset}-{end}/{size}",
+                },
+                timeout=600,
+            )
+            if response.status_code == 308:
+                offset = _session_offset(response)
+                source.seek(offset)
+                continue
+            response.raise_for_status()
+            result = response.json()
+            if result.get("id") and result["id"] != file_id:
+                raise ValueError("Drive returned a different reserved file ID")
+            return {"id": file_id, "size": size, "sha256": digest}
+    raise RuntimeError("reserved Drive upload ended before completion")
 
 
 def drive_upload(file_path: str, name: str, token: str) -> str:
@@ -768,16 +906,84 @@ def gpu_diagnostic(log):
     log(f"GPU: {name} (sm_{cap[0]}{cap[1]}) — torch CUDA kernel check OK ({check:+.2f})")
 
 
+def validate_job_input(job_input: dict, job_id: str = None) -> dict:
+    mode = job_input.get("mode", "legacy")
+    if mode not in ("clip", "legacy"):
+        return structured_error(
+            "invalid_mode", False, "validate", f"unsupported mode: {mode}", job_id)
+    if mode != "clip":
+        return None
+    if int(job_input.get("schema_version", 0)) != PAYLOAD_SCHEMA_VERSION:
+        return structured_error(
+            "schema_mismatch", False, "validate",
+            f"expected schema {PAYLOAD_SCHEMA_VERSION}", job_id)
+    expected_worker = job_input.get("expected_worker_version")
+    if expected_worker != WORKER_VERSION:
+        return structured_error(
+            "version_mismatch", False, "validate",
+            f"expected worker {expected_worker}, running {WORKER_VERSION}", job_id)
+    required = (
+        "video_file_id", "drive_access_token", "input_size", "input_sha256",
+        "result_file_id", "result_upload_session", "roi",
+    )
+    missing = [name for name in required if not job_input.get(name)]
+    if missing:
+        return structured_error(
+            "invalid_payload", False, "validate",
+            f"missing required fields: {', '.join(missing)}", job_id)
+    roi = job_input.get("roi")
+    if not isinstance(roi, dict) or any(
+            key not in roi for key in ("x", "y", "w", "h")):
+        return structured_error(
+            "invalid_roi", False, "validate", "roi requires x, y, w, h", job_id)
+    return None
+
+
+def classify_worker_exception(exc: BaseException, stage: str,
+                              job_id: str = None) -> dict:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 429 or (status and status >= 500):
+        return structured_error(
+            "provider_transient", True, stage, str(exc), job_id,
+            signature=f"http:{status}")
+    if status in (401, 403):
+        return structured_error(
+            "drive_authorization", False, stage, str(exc), job_id,
+            signature=f"http:{status}")
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return structured_error(
+            "network_timeout", True, stage, str(exc), job_id)
+    text = str(exc).lower()
+    if "cuda" in text or "out of memory" in text or "model" in text:
+        return structured_error(
+            "deterministic_model_failure", False, stage, str(exc), job_id)
+    if isinstance(exc, (ValueError, KeyError, json.JSONDecodeError)):
+        return structured_error(
+            "invalid_or_corrupt_media", False, stage, str(exc), job_id)
+    return structured_error("worker_failure", False, stage, str(exc), job_id)
+
+
 def handler(job):
     """RunPod serverless handler — full pipeline."""
     job_input = job["input"]
+    job_id = job.get("id")
 
     video_id = job_input.get("video_id", "unknown")
     log = lambda msg: print(f"[GPU_WORKER] [{video_id}] {msg}", flush=True)
 
     log(f"Worker {WORKER_VERSION} — handler invoked, input keys: {list(job_input.keys())}")
+    validation_error = validate_job_input(job_input, job_id)
+    if validation_error:
+        return {
+            "status": "failed",
+            "worker_version": WORKER_VERSION,
+            "job_id": job_id,
+            "error": validation_error,
+        }
 
     roi = job_input["roi"]
+    mode = job_input.get("mode", "legacy")
     mask_dilation = int(job_input.get("mask_dilation", 8))
     scene_threshold = float(job_input.get("scene_threshold", 27.0))
     min_scene_length = float(job_input.get("min_scene_length", 1.5))
@@ -798,10 +1004,52 @@ def handler(job):
     video_data_b64 = job_input.get("video_data_b64", "")
     downloaded = False
 
+    if mode == "clip" and drive_token:
+        existing = drive_file_metadata(job_input["result_file_id"], drive_token)
+        if (existing and not existing.get("trashed")
+                and int(existing.get("size") or 0) > 0):
+            log("Reserved result already exists; skipping recomputation")
+            return {
+                "status": "completed",
+                "video_id": video_id,
+                "worker_version": WORKER_VERSION,
+                "job_id": job_id,
+                "result_file_id": job_input["result_file_id"],
+                "result_size": int(existing["size"]),
+                "cache_hit": "reserved_drive_result",
+                "timings": {"total_seconds": 0.0},
+            }
+
     if video_file_id and drive_token:
         video_path = os.path.join("/tmp", f"{video_id}_{int(time.time())}.mp4")
         log(f"Downloading video from Drive (file id {video_file_id})...")
-        drive_download(video_file_id, drive_token, video_path)
+        if mode == "clip":
+            metadata = drive_file_metadata(video_file_id, drive_token)
+            if not metadata or metadata.get("trashed"):
+                return {
+                    "status": "failed",
+                    "worker_version": WORKER_VERSION,
+                    "job_id": job_id,
+                    "error": structured_error(
+                        "input_missing", False, "validate",
+                        "Drive input does not exist", job_id),
+                }
+            if int(metadata.get("size") or 0) != int(job_input["input_size"]):
+                return {
+                    "status": "failed",
+                    "worker_version": WORKER_VERSION,
+                    "job_id": job_id,
+                    "error": structured_error(
+                        "input_size_mismatch", False, "validate",
+                        "Drive input size differs from the reserved artifact", job_id),
+                }
+        drive_download(
+            video_file_id,
+            drive_token,
+            video_path,
+            expected_size=job_input.get("input_size"),
+            expected_sha256=job_input.get("input_sha256"),
+        )
         downloaded = True
     elif video_download_url:
         video_path = os.path.join("/tmp", f"{video_id}_{int(time.time())}.mp4")
@@ -824,7 +1072,14 @@ def handler(job):
         log(f"Using direct video_path: {video_path}")
 
     if not video_path or not os.path.exists(video_path):
-        return {"error": f"Video file not found: {video_path}"}
+        return {
+            "status": "failed",
+            "worker_version": WORKER_VERSION,
+            "job_id": job_id,
+            "error": structured_error(
+                "input_missing", False, "validate",
+                f"Video file not found: {video_path}", job_id),
+        }
     log(f"Source video ready: {video_path} ({os.path.getsize(video_path) / 1024**2:.1f} MB)")
 
     work_dir = os.path.join("/tmp", f"work_{video_id}_{int(time.time())}")
@@ -844,6 +1099,54 @@ def handler(job):
         roi = widen_roi(roi, info["width"], info["height"])
         log(f"ROI widened {roi_user} -> {roi} (drawn box marks the caption band; "
             f"word width routinely exceeds it)")
+
+        if mode == "clip":
+            t_clip = time.time()
+            result_path, debug_path = process_clip(
+                video_path, roi, video_id, mask_dilation,
+                fix_raft, fix_flow_complete, propainter_model,
+                work_dir, log,
+                mask_scale_x=mask_scale_x,
+                mask_scale_y=mask_scale_y,
+                mask_pad_x=mask_pad_x,
+                debug=debug_masks,
+            )
+            process_seconds = time.time() - t_clip
+            result = drive_upload_reserved(
+                result_path,
+                job_input["result_file_id"],
+                job_input["result_upload_session"],
+                drive_token,
+                f"{video_id}_result.mp4",
+            )
+            output = {
+                "status": "completed",
+                "video_id": video_id,
+                "worker_version": WORKER_VERSION,
+                "job_id": job_id,
+                "result_file_id": result["id"],
+                "result_size": result["size"],
+                "result_sha256": result.get("sha256"),
+                "timings": {
+                    "process_seconds": round(process_seconds, 3),
+                    "total_seconds": round(time.time() - t_start, 3),
+                },
+            }
+            if debug_path and job_input.get("debug_file_id"):
+                debug = drive_upload_reserved(
+                    debug_path,
+                    job_input["debug_file_id"],
+                    job_input.get("debug_upload_session", ""),
+                    drive_token,
+                    f"{video_id}_debug.mp4",
+                )
+                output.update({
+                    "debug_file_id": debug["id"],
+                    "debug_size": debug["size"],
+                    "debug_sha256": debug.get("sha256"),
+                })
+            log(f"Clip mode complete in {time.time() - t_start:.1f}s")
+            return output
 
         # Step 1: scene detection
         log("Step 1: Scene detection...")
@@ -923,6 +1226,17 @@ def handler(job):
         log(f"Pipeline complete — total time: {t_total:.1f}s")
         return output
 
+    except BaseException as exc:
+        error = classify_worker_exception(
+            exc, "clip" if mode == "clip" else "legacy", job_id)
+        log(f"FAILED {error['code']} at {error['stage']}: {error['message']}")
+        return {
+            "status": "failed",
+            "video_id": video_id,
+            "worker_version": WORKER_VERSION,
+            "job_id": job_id,
+            "error": error,
+        }
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         if downloaded:

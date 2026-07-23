@@ -34,6 +34,6 @@ jobs:
           context: ./gpu_worker
           file: ./gpu_worker/Dockerfile
           push: true
-          tags: shokiii/caption-removal-worker:v13
+          tags: shokiii/caption-removal-worker:v14
           cache-from: type=gha
           cache-to: type=gha,mode=max
