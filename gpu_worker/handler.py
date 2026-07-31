@@ -75,13 +75,14 @@ from model.modules.flow_comp_raft import RAFT_bi
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
 from model.propainter import InpaintGenerator
 from core.utils import to_tensors
+from headline import extract_headline
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_HALF = DEVICE.type == "cuda"
 
 # Logged at job start and returned in the output so it's always provable which
 # image build actually served a job. Bump together with the CI image tag.
-WORKER_VERSION = "v14"
+WORKER_VERSION = "v15"
 PAYLOAD_SCHEMA_VERSION = 1
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
@@ -467,6 +468,8 @@ def write_debug_video(frames, masks, raw_masks, roi: dict, fps: float, output_pa
 
 _OCR = None
 _OCR_ON_CPU = False
+_HEADLINE_OCR = None
+_HEADLINE_OCR_ON_CPU = False
 
 
 def _get_ocr(cpu: bool = False):
@@ -503,6 +506,37 @@ def _ocr_predict(img):
         print(f"[GPU_WORKER] PaddleOCR GPU inference failed ({type(e).__name__}: {e}); "
               f"falling back to CPU OCR", flush=True)
         return _get_ocr(cpu=True).predict(img)
+
+
+def _get_headline_ocr(cpu: bool = False):
+    global _HEADLINE_OCR, _HEADLINE_OCR_ON_CPU
+    if _HEADLINE_OCR is None or (cpu and not _HEADLINE_OCR_ON_CPU):
+        from paddleocr import PaddleOCR
+        kwargs = dict(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            lang="pl",
+        )
+        if cpu:
+            kwargs["device"] = "cpu"
+        _HEADLINE_OCR = PaddleOCR(**kwargs)
+        _HEADLINE_OCR_ON_CPU = cpu
+    return _HEADLINE_OCR
+
+
+def _headline_ocr_predict(img):
+    try:
+        return _get_headline_ocr().predict(img)
+    except Exception as exc:
+        if _HEADLINE_OCR_ON_CPU:
+            raise
+        print(
+            f"[GPU_WORKER] Polish headline OCR GPU inference failed "
+            f"({type(exc).__name__}: {exc}); falling back to CPU OCR",
+            flush=True,
+        )
+        return _get_headline_ocr(cpu=True).predict(img)
 
 
 def clamp_roi(roi: dict, width: int, height: int) -> dict:
@@ -823,11 +857,26 @@ def process_clip(clip_path: str, roi: dict, clip_id: str, mask_dilation: int,
                  mask_scale_x: float = MASK_SCALE_X,
                  mask_scale_y: float = MASK_SCALE_Y,
                  mask_pad_x: float = MASK_PAD_X,
-                 debug: bool = False):
+                 debug: bool = False,
+                 headline_settings: dict = None):
     """Full processing of a single clip: OCR → mask → crop → ProPainter → composite.
     Returns (result_path, debug_path-or-None)."""
     frames, fps = load_video_frames(clip_path)
     n, frame_h, frame_w = frames.shape[0], frames.shape[1], frames.shape[2]
+    headline = None
+    if headline_settings and headline_settings.get("enabled"):
+        try:
+            headline = extract_headline(
+                frames, headline_settings, _headline_ocr_predict)
+        except Exception as exc:
+            headline = {
+                "status": "failed",
+                "reason": f"headline_ocr_error:{type(exc).__name__}",
+            }
+        log(
+            f"{clip_id}: headline extraction "
+            f"{headline.get('status')} "
+            f"(confidence={headline.get('confidence', 'n/a')})")
 
     roi_c = clamp_roi(roi, frame_w, frame_h)
     raw_masks = None
@@ -867,7 +916,7 @@ def process_clip(clip_path: str, roi: dict, clip_id: str, mask_dilation: int,
         log(f"{clip_id}: {n} frames, no text detected — passing through")
 
     write_video(frames, fps, result_path)
-    return result_path, debug_path
+    return result_path, debug_path, headline
 
 
 fix_raft = None
@@ -992,6 +1041,7 @@ def handler(job):
     mask_scale_y = float(job_input.get("mask_scale_y", MASK_SCALE_Y))
     mask_pad_x = float(job_input.get("mask_pad_x", MASK_PAD_X))
     debug_masks = bool(job_input.get("debug_masks", True))
+    headline_settings = job_input.get("headline_extract")
     drive_token = job_input.get("drive_access_token", "")
     log(f"Params — roi={roi} mask_dilation={mask_dilation} scene_threshold={scene_threshold} "
         f"min_scene_length={min_scene_length} max_clip_duration={max_clip_duration} "
@@ -1102,7 +1152,7 @@ def handler(job):
 
         if mode == "clip":
             t_clip = time.time()
-            result_path, debug_path = process_clip(
+            result_path, debug_path, headline = process_clip(
                 video_path, roi, video_id, mask_dilation,
                 fix_raft, fix_flow_complete, propainter_model,
                 work_dir, log,
@@ -1110,6 +1160,7 @@ def handler(job):
                 mask_scale_y=mask_scale_y,
                 mask_pad_x=mask_pad_x,
                 debug=debug_masks,
+                headline_settings=headline_settings,
             )
             process_seconds = time.time() - t_clip
             result = drive_upload_reserved(
@@ -1132,6 +1183,8 @@ def handler(job):
                     "total_seconds": round(time.time() - t_start, 3),
                 },
             }
+            if headline is not None:
+                output["headline"] = headline
             if debug_path and job_input.get("debug_file_id"):
                 debug = drive_upload_reserved(
                     debug_path,
@@ -1169,7 +1222,7 @@ def handler(job):
             clip_id = f"clip_{i+1:04d}"
             log(f"Step 3.{i+1}/{len(clip_paths)}: Processing {clip_id}...")
             t_clip = time.time()
-            result_path, debug_path = process_clip(
+            result_path, debug_path, _headline = process_clip(
                 clip_path, roi, clip_id, mask_dilation,
                 fix_raft, fix_flow_complete, propainter_model,
                 work_dir, log,

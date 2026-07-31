@@ -61,9 +61,9 @@ RUN mkdir -p /app/weights/propainter \
 
 # Pre-download PaddleOCR models at build time (CPU device — no GPU during build).
 # The same model files are reused by the GPU runtime, so cold starts skip the download.
-RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(device='cpu', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, lang='en')" \
+RUN python -c "from paddleocr import PaddleOCR; common=dict(device='cpu', use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False); PaddleOCR(lang='en', **common); PaddleOCR(lang='pl', **common)" \
     || echo "PaddleOCR model prefetch failed — models will download on first cold start instead"
 
-COPY handler.py .
+COPY handler.py headline.py ./
 
 CMD ["python", "-u", "handler.py"]
